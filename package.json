@@ -1,0 +1,170 @@
+{
+  "name": "plan-my-project",
+  "displayName": "Plan My Project",
+  "description": "Unified project planning in projectplan.md with one-level AI expansion and task execution hooks.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:planmyproject.openPlan",
+    "onCommand:planmyproject.planTask",
+    "onCommand:planmyproject.addTask",
+    "onCommand:planmyproject.drillDown",
+    "onCommand:planmyproject.implementTask",
+    "onCommand:planmyproject.deleteTask",
+    "onCommand:planmyproject.rebuildQueue",
+    "onView:planmyproject.tree"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "planmyproject.openPlan",
+        "title": "PlanMyProject: Open Plan"
+      },
+      {
+        "command": "planmyproject.planTask",
+        "title": "PlanMyProject: Plan Task (One Level)",
+        "icon": {
+          "light": "media/plan.svg",
+          "dark": "media/plan.svg"
+        }
+      },
+      {
+        "command": "planmyproject.addTask",
+        "title": "PlanMyProject: Add Task",
+        "icon": {
+          "light": "media/add.svg",
+          "dark": "media/add.svg"
+        }
+      },
+      {
+        "command": "planmyproject.drillDown",
+        "title": "PlanMyProject: Drill Down Task",
+        "icon": {
+          "light": "media/drill.svg",
+          "dark": "media/drill.svg"
+        }
+      },
+      {
+        "command": "planmyproject.implementTask",
+        "title": "PlanMyProject: Implement Task (Copilot)",
+        "icon": {
+          "light": "media/execute.svg",
+          "dark": "media/execute.svg"
+        }
+      },
+      {
+        "command": "planmyproject.deleteTask",
+        "title": "PlanMyProject: Delete Task",
+        "icon": {
+          "light": "media/delete.svg",
+          "dark": "media/delete.svg"
+        }
+      },
+      {
+        "command": "planmyproject.rebuildQueue",
+        "title": "PlanMyProject: Rebuild Execution Queue",
+        "icon": {
+          "light": "media/queue.svg",
+          "dark": "media/queue.svg"
+        }
+      },
+      {
+        "command": "planmyproject.refreshTree",
+        "title": "PlanMyProject: Refresh Tree",
+        "icon": {
+          "light": "media/refresh.svg",
+          "dark": "media/refresh.svg"
+        }
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "planmyproject.planTask",
+        "key": "alt+p",
+        "when": "editorTextFocus"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "planmyproject",
+          "title": "PlanMyProject",
+          "icon": "media/plan.svg"
+        }
+      ]
+    },
+    "views": {
+      "planmyproject": [
+        {
+          "id": "planmyproject.tree",
+          "name": "Implementation Tree"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "planmyproject.addTask",
+          "when": "view == planmyproject.tree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "planmyproject.refreshTree",
+          "when": "view == planmyproject.tree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "planmyproject.rebuildQueue",
+          "when": "view == planmyproject.tree",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "planmyproject.addTask",
+          "when": "view == planmyproject.tree",
+          "group": "inline@1"
+        },
+        {
+          "command": "planmyproject.planTask",
+          "when": "view == planmyproject.tree",
+          "group": "inline@2"
+        },
+        {
+          "command": "planmyproject.implementTask",
+          "when": "view == planmyproject.tree",
+          "group": "inline@3"
+        },
+        {
+          "command": "planmyproject.drillDown",
+          "when": "view == planmyproject.tree",
+          "group": "inline@4"
+        },
+        {
+          "command": "planmyproject.deleteTask",
+          "when": "view == planmyproject.tree",
+          "group": "inline@5"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test:build": "tsc -p ./tsconfig.test.json",
+    "test": "npm run test:build && node --test out-test/test/**/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.6.2"
+  }
+}

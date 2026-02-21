@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "out-test",
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src/implement.ts",
+    "src/model.ts",
+    "src/privacy.ts",
+    "test/**/*.ts"
+  ]
+}
