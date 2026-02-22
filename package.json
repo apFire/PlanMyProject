@@ -1,14 +1,40 @@
 {
   "name": "plan-my-project",
   "displayName": "Plan My Project",
-  "description": "Unified project planning in projectplan.md with one-level AI expansion and task execution hooks.",
-  "version": "0.0.1",
-  "publisher": "local",
+  "description": "Unified project planning AI expansion and task execution.",
+  "version": "0.1.0",
+  "publisher": "aypande",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/apFire/PlanMyProject.git"
+  },
+  "homepage": "https://github.com/apFire/PlanMyProject#readme",
+  "bugs": {
+    "url": "https://github.com/apFire/PlanMyProject/issues"
+  },
   "engines": {
     "vscode": "^1.95.0"
   },
+  "keywords": [
+    "project planning",
+    "task management",
+    "copilot",
+    "ai",
+    "markdown",
+    "productivity"
+  ],
   "categories": [
     "Other"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "PlanMyProject reads and writes workspace files to maintain plans and apply implementation changes."
+    }
+  },
+  "extensionKind": [
+    "workspace"
   ],
   "activationEvents": [
     "onStartupFinished",
@@ -157,10 +183,14 @@
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test:build": "tsc -p ./tsconfig.test.json",
-    "test": "npm run test:build && node --test out-test/test/**/*.test.js"
+    "test": "npm run test:build && node --test out-test/test/**/*.test.js",
+    "verify": "npm run compile && npm test",
+    "package": "npx @vscode/vsce package --no-yarn",
+    "publish:vsce": "npx @vscode/vsce publish --no-yarn"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",

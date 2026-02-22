@@ -6,3 +6,10 @@ out-test/**
 **/*.map
 **/*.ts
 project.md
+.git/**
+.github/**
+.vscode/**
+.vscode-test/**
+.DS_Store
+*.vsix
+package-lock.json
