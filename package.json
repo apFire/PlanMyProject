@@ -41,6 +41,8 @@
     "onCommand:planmyproject.openPlan",
     "onCommand:planmyproject.planTask",
     "onCommand:planmyproject.addTask",
+    "onCommand:planmyproject.addRootTask",
+    "onCommand:planmyproject.loadRequirementsFile",
     "onCommand:planmyproject.drillDown",
     "onCommand:planmyproject.implementTask",
     "onCommand:planmyproject.deleteTask",
@@ -69,6 +71,14 @@
           "light": "media/add.svg",
           "dark": "media/add.svg"
         }
+      },
+      {
+        "command": "planmyproject.addRootTask",
+        "title": "PlanMyProject: Add Root Task"
+      },
+      {
+        "command": "planmyproject.loadRequirementsFile",
+        "title": "PlanMyProject: Load Requirements File"
       },
       {
         "command": "planmyproject.drillDown",
@@ -135,6 +145,13 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "planmyproject.tree",
+        "contents": "No tasks found yet.\n\nUse this when requirements already exist in a root `.md` file.\nConsider: clearer requirement lines produce better root tasks.\n[Load Requirements File](command:planmyproject.loadRequirementsFile)\n\nUse this when starting from scratch or adding one objective manually.\nConsider: keep each root task scoped, actionable, and implementation-ready.\n[Add Root Task](command:planmyproject.addRootTask)",
+        "when": "planmyproject.treeEmpty"
+      }
+    ],
     "menus": {
       "view/title": [
         {

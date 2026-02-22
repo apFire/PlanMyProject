@@ -19,33 +19,63 @@ export interface ParsedPlan {
 const PLAN_TREE_HEADING_RE = /^##\s+Plan Tree\s*$/i;
 const QUEUE_HEADING_RE = /^##\s+Execution Queue\b/i;
 const TASK_LINE_RE = /^(\s*)- \[( |\/|x|X)\] \[([A-Za-z0-9_-]+)\] (.+?)\s*$/;
+const LOOSE_TASK_LINE_RE = /^(\s*)(?:[-*+]|\d+[.)])\s+(?:(?:\[( |\/|x|X)\]\s*)?(?:\[([A-Za-z0-9_-]+)\]\s*)?)?(.+?)\s*$/;
+const TASK_ID_NUMERIC_RE = /^T(\d+)$/;
 
 export function parsePlanMarkdown(text: string): ParsedPlan {
   const lines = text.split(/\r?\n/);
   const planHeadingLine = lines.findIndex((line) => PLAN_TREE_HEADING_RE.test(line.trim()));
   const queueHeadingLine = lines.findIndex((line) => QUEUE_HEADING_RE.test(line.trim()));
 
-  if (planHeadingLine < 0) {
-    return { tasks: [], planHeadingLine: -1, queueHeadingLine: queueHeadingLine };
-  }
+  const start = planHeadingLine >= 0 ? planHeadingLine + 1 : 0;
+  const end = queueHeadingLine > start ? queueHeadingLine : lines.length;
+  const tasks = parseTasksInRange(lines, start, end);
+  return { tasks, planHeadingLine, queueHeadingLine };
+}
 
-  const end = queueHeadingLine > planHeadingLine ? queueHeadingLine : lines.length;
+function parseTasksInRange(lines: string[], start: number, end: number): TaskNode[] {
   const tasks: TaskNode[] = [];
   const stack: TaskNode[] = [];
-
-  for (let line = planHeadingLine + 1; line < end; line += 1) {
-    const raw = lines[line];
-    const match = TASK_LINE_RE.exec(raw);
+  const usedIds = new Set<string>();
+  const reservedIds = collectExplicitTaskIds(lines, start, end);
+  let maxNumericId = 0;
+  for (const id of reservedIds) {
+    const match = TASK_ID_NUMERIC_RE.exec(id);
     if (!match) {
       continue;
     }
+    const value = Number(match[1]);
+    if (value > maxNumericId) {
+      maxNumericId = value;
+    }
+  }
 
-    const indent = match[1].length;
-    const depth = Math.floor(indent / 2);
+  const nextGeneratedId = (): string => {
+    let candidate = "";
+    do {
+      maxNumericId += 1;
+      candidate = `T${String(maxNumericId).padStart(4, "0")}`;
+    } while (usedIds.has(candidate) || reservedIds.has(candidate));
+    return candidate;
+  };
+
+  for (let line = start; line < end; line += 1) {
+    const raw = lines[line];
+    const strict = TASK_LINE_RE.exec(raw);
+    const loose = strict ? undefined : LOOSE_TASK_LINE_RE.exec(raw);
+    const match = strict ?? loose;
+    if (!match || !match[4]?.trim()) {
+      continue;
+    }
+
+    const indent = match[1]?.length ?? 0;
+    const declaredDepth = Math.floor(indent / 2);
+    const depth = Math.min(declaredDepth, stack.length);
+    const id = allocateTaskId(match[3], usedIds, nextGeneratedId);
     const node: TaskNode = {
-      id: match[3],
+      id,
       title: match[4].trim(),
-      status: normalizeStatus(match[2]),
+      status: normalizeStatus(match[2] ?? " "),
       depth,
       parentId: null,
       children: [],
@@ -67,7 +97,36 @@ export function parsePlanMarkdown(text: string): ParsedPlan {
     stack[depth] = node;
   }
 
-  return { tasks, planHeadingLine, queueHeadingLine };
+  return tasks;
+}
+
+function collectExplicitTaskIds(lines: string[], start: number, end: number): Set<string> {
+  const ids = new Set<string>();
+  for (let line = start; line < end; line += 1) {
+    const raw = lines[line];
+    const strict = TASK_LINE_RE.exec(raw);
+    const loose = strict ? undefined : LOOSE_TASK_LINE_RE.exec(raw);
+    const id = strict?.[3] ?? loose?.[3];
+    if (id) {
+      ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function allocateTaskId(
+  requestedId: string | undefined,
+  usedIds: Set<string>,
+  nextGeneratedId: () => string
+): string {
+  if (requestedId && !usedIds.has(requestedId)) {
+    usedIds.add(requestedId);
+    return requestedId;
+  }
+
+  const generated = nextGeneratedId();
+  usedIds.add(generated);
+  return generated;
 }
 
 export function serializePlanMarkdown(tasks: TaskNode[]): string {

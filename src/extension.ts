@@ -23,6 +23,36 @@ const MAX_IMPLEMENTATION_FILE_CHARS = 14_000;
 const MAX_IMPLEMENTATION_TOTAL_CHARS = 52_000;
 const MAX_REPAIR_INPUT_CHARS = 32_000;
 const BOOTSTRAP_TASK_TITLE = "Add your first objective";
+const TREE_EMPTY_CONTEXT_KEY = "planmyproject.treeEmpty";
+const REQUIREMENT_FILE_HINTS = [
+  "project.md",
+  "requirements.md",
+  "requirement.md",
+  "prd.md",
+  "spec.md",
+  "specification.md",
+  "readme.md"
+] as const;
+const MAX_IMPORTED_ROOT_TASKS = 24;
+const MIN_IMPORT_TASK_LENGTH = 8;
+const MAX_IMPORT_TASK_LENGTH = 180;
+const NON_TASK_HEADING_TITLES = new Set([
+  "overview",
+  "introduction",
+  "background",
+  "context",
+  "goals",
+  "non goals",
+  "non-goals",
+  "requirements",
+  "functional requirements",
+  "non functional requirements",
+  "non-functional requirements",
+  "acceptance criteria",
+  "notes",
+  "appendix",
+  "summary"
+]);
 
 let treeProvider: PlanTreeProvider;
 let planDecorationType: vscode.TextEditorDecorationType;
@@ -44,6 +74,7 @@ interface FileSnapshot {
 export function activate(context: vscode.ExtensionContext): void {
   treeProvider = new PlanTreeProvider();
   context.subscriptions.push(vscode.window.registerTreeDataProvider("planmyproject.tree", treeProvider));
+  void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, true);
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider(
       [{ scheme: "file", pattern: `**/{${PLAN_FILENAMES.join(",")}}` }],
@@ -72,6 +103,12 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("planmyproject.addTask", async (arg?: unknown) => {
       await handleAddTask(arg);
+    }),
+    vscode.commands.registerCommand("planmyproject.addRootTask", async () => {
+      await handleAddTask(undefined, true);
+    }),
+    vscode.commands.registerCommand("planmyproject.loadRequirementsFile", async () => {
+      await handleLoadRequirementsFile();
     }),
     vscode.commands.registerCommand("planmyproject.drillDown", async (arg?: unknown) => {
       await handleDrillDown(arg);
@@ -113,7 +150,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       activePlanUri = undefined;
-      treeProvider.setTasks([]);
+      setTreeTasks([]);
       updateVisiblePlanDecorations();
     })
   );
@@ -272,17 +309,19 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
   );
 }
 
-async function handleAddTask(arg?: unknown): Promise<void> {
+async function handleAddTask(arg?: unknown, forceRoot = false): Promise<void> {
   const taskRef = extractTaskCommandRef(arg);
   const doc = await resolvePlanDocumentForCommand(taskRef);
   const parsed = parsePlanMarkdown(doc.getText());
   const activeEditor = vscode.window.activeTextEditor;
   const taskId = taskRef.taskId;
-  const parent = taskId
-    ? findTaskById(parsed.tasks, taskId)
-    : activeEditor && isPlanDocument(activeEditor.document)
-      ? findTaskByLine(parsed.tasks, activeEditor.selection.active.line)
-      : undefined;
+  const parent = forceRoot
+    ? undefined
+    : taskId
+      ? findTaskById(parsed.tasks, taskId)
+      : activeEditor && isPlanDocument(activeEditor.document)
+        ? findTaskByLine(parsed.tasks, activeEditor.selection.active.line)
+        : undefined;
 
   const input = await vscode.window.showInputBox({
     prompt: parent ? `Add child task under ${parent.id}` : "Add top-level task",
@@ -293,7 +332,7 @@ async function handleAddTask(arg?: unknown): Promise<void> {
     return;
   }
 
-  if (parent) {
+  if (parent && !forceRoot) {
     const nextId = createTaskIdGenerator(parsed.tasks);
     parent.children.push(makeTaskNode(nextId(), title, parent.depth + 1, parent.id));
   } else if (isOnlyBootstrapPlaceholder(parsed.tasks)) {
@@ -454,8 +493,14 @@ async function syncExecutionQueue(document: vscode.TextDocument): Promise<void> 
 async function refreshFromDocument(document: vscode.TextDocument): Promise<void> {
   const parsed = parsePlanMarkdown(document.getText());
   activePlanUri = document.uri;
-  treeProvider.setTasks(parsed.tasks, document.uri);
+  setTreeTasks(parsed.tasks, document.uri);
   updateVisiblePlanDecorations();
+}
+
+function setTreeTasks(tasks: TaskNode[], sourceUri?: vscode.Uri): void {
+  const visibleTasks = isOnlyBootstrapPlaceholder(tasks) ? [] : tasks;
+  treeProvider.setTasks(visibleTasks, sourceUri);
+  void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, visibleTasks.length === 0);
 }
 
 function updateVisiblePlanDecorations(): void {
@@ -464,11 +509,12 @@ function updateVisiblePlanDecorations(): void {
       continue;
     }
     const parsed = parsePlanMarkdown(editor.document.getText());
+    const tasks = isOnlyBootstrapPlaceholder(parsed.tasks) ? [] : parsed.tasks;
     const planLines: vscode.DecorationOptions[] = [];
     const executeLines: vscode.DecorationOptions[] = [];
 
-    const leaves = new Set(listLeafTasks(parsed.tasks).map((task) => task.id));
-    walk(parsed.tasks, (task) => {
+    const leaves = new Set(listLeafTasks(tasks).map((task) => task.id));
+    walk(tasks, (task) => {
       if (task.line < 0 || task.line >= editor.document.lineCount) {
         return;
       }
@@ -575,6 +621,296 @@ function getWorkspaceRootUri(): vscode.Uri {
     throw new Error("Open a workspace folder to use PlanMyProject.");
   }
   return root;
+}
+
+async function pickRequirementFileFromRoot(root: vscode.Uri): Promise<vscode.Uri | undefined> {
+  const entries = await vscode.workspace.fs.readDirectory(root);
+  const candidates = entries
+    .filter(([name, type]) => type === vscode.FileType.File && name.toLowerCase().endsWith(".md"))
+    .map(([name]) => name)
+    .filter((name) => !PLAN_FILENAMES.includes(name.toLowerCase() as (typeof PLAN_FILENAMES)[number]));
+
+  if (candidates.length === 0) {
+    vscode.window.showWarningMessage("No markdown requirements file was found in workspace root.");
+    return undefined;
+  }
+
+  const preferredOrder = new Map<string, number>();
+  REQUIREMENT_FILE_HINTS.forEach((name, index) => preferredOrder.set(name, index));
+  const sorted = [...candidates].sort((a, b) => {
+    const rankA = preferredOrder.get(a.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+    const rankB = preferredOrder.get(b.toLowerCase()) ?? Number.MAX_SAFE_INTEGER;
+    if (rankA !== rankB) {
+      return rankA - rankB;
+    }
+    return a.localeCompare(b, undefined, { sensitivity: "base" });
+  });
+
+  if (sorted.length === 1) {
+    return vscode.Uri.joinPath(root, sorted[0]);
+  }
+
+  const picked = await vscode.window.showQuickPick(
+    sorted.map((name) => ({
+      label: name,
+      description: preferredOrder.has(name.toLowerCase()) ? "recommended" : undefined
+    })),
+    { placeHolder: "Select requirements file to import root tasks from" }
+  );
+
+  if (!picked) {
+    return undefined;
+  }
+  return vscode.Uri.joinPath(root, picked.label);
+}
+
+function extractRootTaskCandidates(markdown: string): string[] {
+  const lines = markdown.split(/\r?\n/);
+  const titles: string[] = [];
+  const seen = new Set<string>();
+  let inCodeBlock = false;
+  let paragraphBuffer: string[] = [];
+
+  const flushParagraph = (): void => {
+    if (paragraphBuffer.length === 0) {
+      return;
+    }
+    const paragraph = paragraphBuffer.join(" ").replace(/\s+/g, " ").trim();
+    paragraphBuffer = [];
+    if (!paragraph) {
+      return;
+    }
+    pushCandidate(paragraph, titles, seen);
+    if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
+      return;
+    }
+  };
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith("```")) {
+      flushParagraph();
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      continue;
+    }
+
+    if (/^<!--.*-->$/.test(trimmed)) {
+      continue;
+    }
+
+    const heading = /^#{1,6}\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      flushParagraph();
+      continue;
+    }
+
+    const listMatch = /^[-*+]\s+(.+)$/.exec(rawLine) ?? /^\d+[.)]\s+(.+)$/.exec(trimmed);
+    if (listMatch) {
+      flushParagraph();
+      pushCandidate(listMatch[1], titles, seen);
+      if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
+        break;
+      }
+      continue;
+    }
+
+    paragraphBuffer.push(trimmed);
+    if (/[.!?]$/.test(trimmed)) {
+      flushParagraph();
+    }
+    if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
+      break;
+    }
+  }
+
+  flushParagraph();
+  return titles.slice(0, MAX_IMPORTED_ROOT_TASKS);
+}
+
+function pushCandidate(rawValue: string, titles: string[], seen: Set<string>): void {
+  const title = normalizeImportedTaskTitle(rawValue);
+  if (!title || isGenericHeadingTitle(title)) {
+    return;
+  }
+
+  const key = title.toLowerCase();
+  if (seen.has(key)) {
+    return;
+  }
+
+  seen.add(key);
+  titles.push(title);
+}
+
+function isGenericHeadingTitle(value: string): boolean {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[:\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return NON_TASK_HEADING_TITLES.has(normalized);
+}
+
+function normalizeImportedTaskTitle(value: string): string | undefined {
+  const compact = value
+    .replace(/^\s*[-*+\d.)]+\s+/, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/^[\[\(]+/, "")
+    .replace(/[\]\)]+$/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.:;,\-]+$/, "")
+    .trim();
+
+  if (compact.length < MIN_IMPORT_TASK_LENGTH || compact.length > MAX_IMPORT_TASK_LENGTH) {
+    return undefined;
+  }
+
+  if (/^(?:epic|story|task|item)\s+\d+$/i.test(compact)) {
+    return undefined;
+  }
+
+  // Avoid importing pure metadata lines like "Owner: X" as root requirements.
+  if (/^[A-Za-z][A-Za-z0-9 _-]{0,24}:\s+\S+/.test(compact)) {
+    return undefined;
+  }
+
+  return compact;
+}
+
+function hasImportableMarkdownRequirements(markdown: string): boolean {
+  return extractRootTaskCandidates(markdown).length > 0;
+}
+
+async function validateRequirementFileContent(uri: vscode.Uri): Promise<boolean> {
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  const content = Buffer.from(bytes).toString("utf8");
+  return hasImportableMarkdownRequirements(content);
+}
+
+function hasExplicitRequirementList(markdown: string): boolean {
+  const lines = markdown.split(/\r?\n/);
+  let inCodeBlock = false;
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) {
+      continue;
+    }
+    if (/^[-*+]\s+.+/.test(rawLine) || /^\d+[.)]\s+.+/.test(trimmed)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function buildConsolidatedRequirementTitle(requirementFile: vscode.Uri, candidates: string[]): string {
+  const stem = path.parse(requirementFile.fsPath).name.replace(/[_-]+/g, " ").trim();
+  if (stem.length >= 3) {
+    return `Implement requirements from ${stem}`;
+  }
+  return candidates[0];
+}
+
+async function pickLoadableRequirementFile(root: vscode.Uri): Promise<vscode.Uri | undefined> {
+  const initial = await pickRequirementFileFromRoot(root);
+  if (!initial) {
+    return undefined;
+  }
+
+  if (await validateRequirementFileContent(initial)) {
+    return initial;
+  }
+
+  const decision = await vscode.window.showQuickPick(
+    [
+      { label: "Choose another file", mode: "retry" as const },
+      { label: "Use this file anyway", mode: "force" as const }
+    ],
+    { placeHolder: "Selected file had no obvious task lines. Pick another file or continue." }
+  );
+
+  if (!decision) {
+    return undefined;
+  }
+  if (decision.mode === "force") {
+    return initial;
+  }
+  return pickLoadableRequirementFile(root);
+}
+
+async function handleLoadRequirementsFile(): Promise<void> {
+  const root = getWorkspaceRootUri();
+  const requirementFile = await pickLoadableRequirementFile(root);
+  if (!requirementFile) {
+    return;
+  }
+
+  const bytes = await vscode.workspace.fs.readFile(requirementFile);
+  const content = Buffer.from(bytes).toString("utf8");
+  const importedTitles = extractRootTaskCandidates(content);
+  if (importedTitles.length === 0) {
+    vscode.window.showWarningMessage(
+      "Could not infer root tasks from this file. Try shorter requirement statements or add bullet/numbered lines."
+    );
+    return;
+  }
+  const explicitList = hasExplicitRequirementList(content);
+  const finalTitles = !explicitList && importedTitles.length > 1
+    ? [buildConsolidatedRequirementTitle(requirementFile, importedTitles)]
+    : importedTitles;
+
+  const planDoc = await ensurePlanDocument();
+  const parsed = parsePlanMarkdown(planDoc.getText());
+  const hasExistingTasks = parsed.tasks.length > 0 && !isOnlyBootstrapPlaceholder(parsed.tasks);
+
+  let mode: "replace" | "append" = "replace";
+  if (hasExistingTasks) {
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: "Append imported tasks", description: "Keep existing tasks and add new roots", mode: "append" as const },
+        { label: "Replace existing tasks", description: "Discard current tree and import fresh", mode: "replace" as const }
+      ],
+      { placeHolder: "How should imported requirement tasks be applied?" }
+    );
+    if (!picked) {
+      return;
+    }
+    mode = picked.mode;
+  }
+
+  const nextTasks = mode === "replace" || isOnlyBootstrapPlaceholder(parsed.tasks)
+    ? []
+    : [...parsed.tasks];
+  const nextId = createTaskIdGenerator(nextTasks);
+  for (const title of finalTitles) {
+    nextTasks.push(makeTaskNode(nextId(), title, 0, null));
+  }
+
+  await writePlanContent(planDoc.uri, serializePlanMarkdown(nextTasks));
+  const latest = await vscode.workspace.openTextDocument(planDoc.uri);
+  await vscode.window.showTextDocument(latest, { preview: false });
+  await refreshFromDocument(latest);
+  vscode.window.showInformationMessage(
+    `Imported ${finalTitles.length} root task(s) from ${vscode.workspace.asRelativePath(requirementFile, false)}.`
+  );
 }
 
 async function writePlanContent(uri: vscode.Uri, text: string): Promise<void> {

@@ -104,6 +104,25 @@ test("parseAiTaskTitles extracts bullets, removes duplicates, and caps output", 
   assert.deepEqual(titles, ["Create API route", "Add validation layer", "Write integration tests"]);
 });
 
+test("parsePlanMarkdown supports plain markdown task lists without schema", () => {
+  const input = [
+    "# projectplan.md",
+    "",
+    "1. Build authentication module",
+    "2. Add login endpoint",
+    "  - Write unit tests"
+  ].join("\n");
+
+  const parsed = parsePlanMarkdown(input);
+  assert.equal(parsed.planHeadingLine, -1);
+  assert.equal(parsed.tasks.length, 2);
+  assert.equal(parsed.tasks[0].title, "Build authentication module");
+  assert.equal(parsed.tasks[1].title, "Add login endpoint");
+  assert.equal(parsed.tasks[1].children.length, 1);
+  assert.equal(parsed.tasks[1].children[0].title, "Write unit tests");
+  assert.match(parsed.tasks[0].id, /^T\d{4}$/);
+});
+
 test("findTaskById returns undefined when not found", () => {
   const root = makeTaskNode("T0001", "Root", 0, null);
   assert.equal(findTaskById([root], "T9999"), undefined);
