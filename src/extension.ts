@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ImplementationPayload, parseImplementationPayload } from "./implement";
+import { ImplementationPayload, isSensitiveWorkspacePath, parseImplementationPayload } from "./implement";
 import { maskSensitiveText, streamCopilotText } from "./lm";
 import {
   TaskNode,
@@ -22,8 +22,11 @@ const MAX_IMPLEMENTATION_SNAPSHOTS = 8;
 const MAX_IMPLEMENTATION_FILE_CHARS = 14_000;
 const MAX_IMPLEMENTATION_TOTAL_CHARS = 52_000;
 const MAX_REPAIR_INPUT_CHARS = 32_000;
+const COPILOT_PATH_PREVIEW_LIMIT = 8;
+const SENSITIVE_FILE_PREVIEW_LIMIT = 8;
 const BOOTSTRAP_TASK_TITLE = "Add your first objective";
 const TREE_EMPTY_CONTEXT_KEY = "planmyproject.treeEmpty";
+const COPILOT_ALLOW_ALL_LABEL = "Allow All";
 const REQUIREMENT_FILE_HINTS = [
   "project.md",
   "requirements.md",
@@ -59,6 +62,7 @@ let planDecorationType: vscode.TextEditorDecorationType;
 let executeDecorationType: vscode.TextEditorDecorationType;
 let internalWriteDepth = 0;
 let activePlanUri: vscode.Uri | undefined;
+let copilotConsentAllowAll = false;
 
 interface TaskCommandRef {
   taskId?: string;
@@ -253,6 +257,17 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       let wroteAny = false;
       const prompt = buildPlanPrompt(target, ancestors, relatedFiles, existingChildren, mode);
       const safePrompt = maskSensitiveText(prompt);
+      const allowPlanRequest = await requestCopilotConsent(`Plan task ${target.id}`, [
+        `Selected task: [${target.id}] ${target.title}`,
+        `Ancestor tasks included: ${ancestors.length}`,
+        `Existing child titles included: ${existingChildren.length}`,
+        `Workspace file paths included: ${summarizePathList(relatedFiles, COPILOT_PATH_PREVIEW_LIMIT)}`,
+        "Workspace file contents included: none"
+      ]);
+      if (!allowPlanRequest) {
+        vscode.window.showInformationMessage(`Cancelled planning ${target.id}. No data was sent to Copilot.`);
+        return;
+      }
 
       if (mode === "replace") {
         target.children = [];
@@ -402,6 +417,18 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
       );
       const prompt = buildImplementPrompt(target, ancestors, relatedFiles, snapshots);
       const safePrompt = maskSensitiveText(prompt);
+      const snapshotChars = snapshots.reduce((sum, snapshot) => sum + snapshot.content.length, 0);
+      const allowImplementRequest = await requestCopilotConsent(`Implement task ${target.id}`, [
+        `Selected task: [${target.id}] ${target.title}`,
+        `Ancestor tasks included: ${ancestors.length}`,
+        `Workspace file paths included: ${summarizePathList(relatedFiles, COPILOT_PATH_PREVIEW_LIMIT)}`,
+        `Workspace file contents included: ${snapshots.length} snapshot(s), ${snapshotChars.toLocaleString()} chars total`,
+        `If parsing fails, a repair follow-up may send up to ${MAX_REPAIR_INPUT_CHARS.toLocaleString()} chars from Copilot output`
+      ]);
+      if (!allowImplementRequest) {
+        vscode.window.showInformationMessage(`Cancelled implementation for ${target.id}. No data was sent to Copilot.`);
+        return;
+      }
       let modelOutput = "";
 
       progress.report({ message: "Requesting implementation edits from Copilot..." });
@@ -1092,6 +1119,56 @@ async function collectRelevantFileSnapshots(
   return snapshots;
 }
 
+function summarizePathList(paths: string[], previewLimit: number): string {
+  if (paths.length === 0) {
+    return "none";
+  }
+
+  const preview = paths.slice(0, previewLimit);
+  const overflow = paths.length - preview.length;
+  const suffix = overflow > 0 ? `, +${overflow} more` : "";
+  return `${paths.length} (${preview.join(", ")}${suffix})`;
+}
+
+async function requestCopilotConsent(operation: string, summaryLines: string[]): Promise<boolean> {
+  if (copilotConsentAllowAll) {
+    return true;
+  }
+
+  const message = [
+    `${operation} sends context to GitHub Copilot.`,
+    "Summary of data to be sent:",
+    ...summaryLines.map((line) => `- ${line}`),
+    "Continue?"
+  ].join("\n");
+  const decision = await vscode.window.showWarningMessage(
+    message,
+    { modal: true },
+    "Send to Copilot",
+    COPILOT_ALLOW_ALL_LABEL
+  );
+  if (decision === COPILOT_ALLOW_ALL_LABEL) {
+    copilotConsentAllowAll = true;
+    return true;
+  }
+  return decision === "Send to Copilot";
+}
+
+async function requestSensitiveFileOverrideConsent(paths: string[]): Promise<boolean> {
+  const sorted = [...paths].sort((a, b) => a.localeCompare(b));
+  const preview = sorted.slice(0, SENSITIVE_FILE_PREVIEW_LIMIT);
+  const overflow = sorted.length - preview.length;
+  const message = [
+    "Copilot generated changes to sensitive workspace files:",
+    ...preview.map((filePath) => `- ${filePath}`),
+    ...(overflow > 0 ? [`- +${overflow} more file(s)`] : []),
+    "These files can alter project, editor, or automation behavior.",
+    "Apply sensitive file overrides?"
+  ].join("\n");
+  const decision = await vscode.window.showWarningMessage(message, { modal: true }, "Apply Sensitive Changes");
+  return decision === "Apply Sensitive Changes";
+}
+
 async function parseImplementationWithRepair(
   modelOutput: string,
   token: vscode.CancellationToken
@@ -1101,6 +1178,16 @@ async function parseImplementationWithRepair(
   } catch (firstError) {
     if (token.isCancellationRequested) {
       throw firstError;
+    }
+
+    const repairExcerptLength = Math.min(modelOutput.length, MAX_REPAIR_INPUT_CHARS);
+    const allowRepairRequest = await requestCopilotConsent("Repair implementation response", [
+      "Reason: the first Copilot response was not valid JSON.",
+      `Previous Copilot output excerpt length: ${repairExcerptLength.toLocaleString()} chars`,
+      "Additional workspace file contents included: none"
+    ]);
+    if (!allowRepairRequest) {
+      throw new Error("Cancelled implementation: repair request to Copilot was not approved.");
     }
 
     const repairPrompt = buildImplementRepairPrompt(modelOutput);
@@ -1127,6 +1214,14 @@ async function applyImplementationChanges(payload: ImplementationPayload): Promi
 
   for (const change of payload.changes) {
     finalByPath.set(change.path, change.content);
+  }
+
+  const sensitivePaths = Array.from(finalByPath.keys()).filter((relativePath) => isSensitiveWorkspacePath(relativePath));
+  if (sensitivePaths.length > 0) {
+    const approved = await requestSensitiveFileOverrideConsent(sensitivePaths);
+    if (!approved) {
+      throw new Error("Cancelled implementation: sensitive file overrides were not approved.");
+    }
   }
 
   for (const [relativePath, content] of finalByPath.entries()) {

@@ -13,6 +13,22 @@ export interface ImplementationPayload {
   risks: string[];
 }
 
+const SENSITIVE_BASENAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "npm-shrinkwrap.json",
+  ".gitignore",
+  ".gitattributes",
+  ".editorconfig",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml"
+]);
+
 export function parseImplementationPayload(text: string): ImplementationPayload {
   const rawJson = extractJsonObject(text);
   if (!rawJson) {
@@ -89,6 +105,45 @@ export function normalizeWorkspaceRelativePath(input: string): string | undefine
   }
 
   return normalized;
+}
+
+export function isSensitiveWorkspacePath(input: string): boolean {
+  const normalized = normalizeWorkspaceRelativePath(input);
+  if (!normalized) {
+    return false;
+  }
+
+  const lower = normalized.toLowerCase();
+  if (
+    lower.startsWith(".git/")
+    || lower.startsWith(".vscode/")
+    || lower.startsWith(".github/")
+    || lower.startsWith(".devcontainer/")
+  ) {
+    return true;
+  }
+
+  const basename = path.posix.basename(lower);
+  if (basename.startsWith(".env")) {
+    return true;
+  }
+  if (SENSITIVE_BASENAMES.has(basename)) {
+    return true;
+  }
+  if (basename === "jsconfig.json") {
+    return true;
+  }
+  if (/^tsconfig(?:\..+)?\.json$/.test(basename)) {
+    return true;
+  }
+  if (/^\.?eslintrc(?:\..+)?$/.test(basename) || /^eslint\.config\..+$/.test(basename)) {
+    return true;
+  }
+  if (/^\.?prettierrc(?:\..+)?$/.test(basename) || /^prettier\.config\..+$/.test(basename)) {
+    return true;
+  }
+
+  return false;
 }
 
 function toStringList(value: unknown): string[] {

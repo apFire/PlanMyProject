@@ -10,6 +10,7 @@ project.md
 .github/**
 .vscode/**
 .vscode-test/**
+.gitignore
 .DS_Store
 *.vsix
 package-lock.json

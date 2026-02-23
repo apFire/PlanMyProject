@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeWorkspaceRelativePath, parseImplementationPayload } from "../src/implement";
+import {
+  isSensitiveWorkspacePath,
+  normalizeWorkspaceRelativePath,
+  parseImplementationPayload
+} from "../src/implement";
 
 test("parseImplementationPayload parses fenced JSON and normalizes paths", () => {
   const raw = [
@@ -41,4 +45,14 @@ test("normalizeWorkspaceRelativePath blocks absolute and traversal paths", () =>
   assert.equal(normalizeWorkspaceRelativePath("./src/main.ts"), "src/main.ts");
   assert.equal(normalizeWorkspaceRelativePath("../main.ts"), undefined);
   assert.equal(normalizeWorkspaceRelativePath("/etc/passwd"), undefined);
+});
+
+test("isSensitiveWorkspacePath flags sensitive paths and allows regular source files", () => {
+  assert.equal(isSensitiveWorkspacePath("src/main.ts"), false);
+  assert.equal(isSensitiveWorkspacePath("./src/main.ts"), false);
+  assert.equal(isSensitiveWorkspacePath(".vscode/settings.json"), true);
+  assert.equal(isSensitiveWorkspacePath(".github/workflows/ci.yml"), true);
+  assert.equal(isSensitiveWorkspacePath("package.json"), true);
+  assert.equal(isSensitiveWorkspacePath("tsconfig.json"), true);
+  assert.equal(isSensitiveWorkspacePath("config/.env.local"), true);
 });

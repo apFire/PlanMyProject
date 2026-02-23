@@ -35,3 +35,41 @@ Supported root plan files (in priority order):
   - all done => `[x]`
   - partial done/in-progress => `[/]`
   - otherwise => `[ ]`
+
+## Data Exchange with Copilot
+
+PlanMyProject only sends data to GitHub Copilot when you run Copilot-backed actions (`Plan Task`, `Implement Task`, and repair retries during implement parsing).
+
+- Consent is requested before each send.
+- Consent dialog options:
+  - `Send to Copilot`: approve this request only.
+  - `Allow All`: approve this request and auto-approve future Copilot requests for the current extension session.
+  - Close/Cancel: no data is sent.
+- For `Plan Task`, the prompt includes:
+  - selected task id/title
+  - ancestor task titles
+  - existing child task titles (when present)
+  - relevant workspace file paths
+  - no file contents
+- For `Implement Task`, the prompt includes:
+  - selected task id/title and ancestor task titles
+  - relevant workspace file paths
+  - file content snapshots from relevant files (text-only, size-limited, may be truncated)
+- If implement JSON parsing fails, a repair request may send an excerpt of the prior Copilot output.
+
+## Supported Workspace Edits
+
+When `Implement Task` is approved and Copilot returns valid JSON changes, the extension applies file writes in your workspace.
+
+- Supported:
+  - create new files
+  - update existing files
+  - create missing parent directories for generated files
+- Safety and scope:
+  - only workspace-relative paths are accepted
+  - absolute paths and path traversal (`../`) are rejected
+  - if duplicate paths are returned, the last entry wins
+- Not supported:
+  - file deletion
+  - file rename/move operations
+- Extra confirmation is required for sensitive targets (for example `.env*`, `.git/*`, `.github/*`, `.vscode/*`, lockfiles, and common config files like `tsconfig*.json`, ESLint, and Prettier configs).
