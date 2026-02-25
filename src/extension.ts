@@ -26,6 +26,7 @@ const COPILOT_PATH_PREVIEW_LIMIT = 8;
 const SENSITIVE_FILE_PREVIEW_LIMIT = 8;
 const BOOTSTRAP_TASK_TITLE = "Add your first objective";
 const TREE_EMPTY_CONTEXT_KEY = "planmyproject.treeEmpty";
+const WORKSPACE_OPEN_CONTEXT_KEY = "planmyproject.workspaceOpen";
 const COPILOT_ALLOW_ALL_LABEL = "Allow All";
 const REQUIREMENT_FILE_HINTS = [
   "project.md",
@@ -78,6 +79,7 @@ interface FileSnapshot {
 export function activate(context: vscode.ExtensionContext): void {
   treeProvider = new PlanTreeProvider();
   context.subscriptions.push(vscode.window.registerTreeDataProvider("planmyproject.tree", treeProvider));
+  updateWorkspaceContext();
   void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, true);
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider(
@@ -98,37 +100,67 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand("planmyproject.openPlan", async () => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       const doc = await ensurePlanDocument();
       await vscode.window.showTextDocument(doc, { preview: false });
       await refreshFromDocument(doc);
     }),
     vscode.commands.registerCommand("planmyproject.planTask", async (arg?: unknown) => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handlePlanTask(arg);
     }),
     vscode.commands.registerCommand("planmyproject.addTask", async (arg?: unknown) => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleAddTask(arg);
     }),
     vscode.commands.registerCommand("planmyproject.addRootTask", async () => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleAddTask(undefined, true);
     }),
     vscode.commands.registerCommand("planmyproject.loadRequirementsFile", async () => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleLoadRequirementsFile();
     }),
     vscode.commands.registerCommand("planmyproject.drillDown", async (arg?: unknown) => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleDrillDown(arg);
     }),
     vscode.commands.registerCommand("planmyproject.implementTask", async (arg?: unknown) => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleImplementTask(arg);
     }),
     vscode.commands.registerCommand("planmyproject.deleteTask", async (arg?: unknown) => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       await handleDeleteTask(arg);
     }),
     vscode.commands.registerCommand("planmyproject.rebuildQueue", async () => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       const doc = await resolvePlanDocumentForCommand();
       await syncExecutionQueue(doc);
       await refreshFromDocument(await vscode.workspace.openTextDocument(doc.uri));
     }),
     vscode.commands.registerCommand("planmyproject.refreshTree", async () => {
+      if (!ensureWorkspaceFolderOpen()) {
+        return;
+      }
       const doc = await findExistingPlanDocument();
       if (doc) {
         await refreshFromDocument(doc);
@@ -160,6 +192,24 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(async () => {
+      updateWorkspaceContext();
+      if (!hasOpenWorkspaceFolder()) {
+        activePlanUri = undefined;
+        setTreeTasks([]);
+        updateVisiblePlanDecorations();
+        return;
+      }
+
+      const existing = await findExistingPlanDocument();
+      if (existing) {
+        await refreshFromDocument(existing);
+        return;
+      }
+      activePlanUri = undefined;
+      setTreeTasks([]);
+      updateVisiblePlanDecorations();
+    }),
     vscode.workspace.onDidChangeTextDocument(async (event) => {
       if (!isPlanDocument(event.document)) {
         return;
@@ -530,6 +580,22 @@ function setTreeTasks(tasks: TaskNode[], sourceUri?: vscode.Uri): void {
   void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, visibleTasks.length === 0);
 }
 
+function hasOpenWorkspaceFolder(): boolean {
+  return (vscode.workspace.workspaceFolders?.length ?? 0) > 0;
+}
+
+function ensureWorkspaceFolderOpen(): boolean {
+  if (hasOpenWorkspaceFolder()) {
+    return true;
+  }
+  void vscode.window.showWarningMessage("PlanMyProject requires an open folder or workspace.");
+  return false;
+}
+
+function updateWorkspaceContext(): void {
+  void vscode.commands.executeCommand("setContext", WORKSPACE_OPEN_CONTEXT_KEY, hasOpenWorkspaceFolder());
+}
+
 function updateVisiblePlanDecorations(): void {
   for (const editor of vscode.window.visibleTextEditors) {
     if (!isPlanDocument(editor.document)) {
@@ -645,7 +711,7 @@ async function findExistingPlanUris(): Promise<vscode.Uri[]> {
 function getWorkspaceRootUri(): vscode.Uri {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri;
   if (!root) {
-    throw new Error("Open a workspace folder to use PlanMyProject.");
+    throw new Error("PlanMyProject requires an open folder or workspace.");
   }
   return root;
 }

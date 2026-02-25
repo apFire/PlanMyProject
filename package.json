@@ -126,7 +126,7 @@
       {
         "command": "planmyproject.planTask",
         "key": "alt+p",
-        "when": "editorTextFocus"
+        "when": "editorTextFocus && planmyproject.workspaceOpen"
       }
     ],
     "viewsContainers": {
@@ -150,24 +150,29 @@
       {
         "view": "planmyproject.tree",
         "contents": "No tasks found yet.\n\nUse this when requirements already exist in a root `.md` file.\nConsider: clearer requirement lines produce better root tasks.\n[Load Requirements File](command:planmyproject.loadRequirementsFile)\n\nUse this when starting from scratch or adding one objective manually.\nConsider: keep each root task scoped, actionable, and implementation-ready.\n[Add Root Task](command:planmyproject.addRootTask)",
-        "when": "planmyproject.treeEmpty"
+        "when": "planmyproject.workspaceOpen && planmyproject.treeEmpty"
+      },
+      {
+        "view": "planmyproject.tree",
+        "contents": "PlanMyProject requires an open folder or workspace.\n\nOpen a project to create and manage your plan file.\n[Open Folder or Workspace](command:vscode.openFolder)",
+        "when": "!planmyproject.workspaceOpen"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "planmyproject.addTask",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && planmyproject.workspaceOpen",
           "group": "navigation@1"
         },
         {
           "command": "planmyproject.refreshTree",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && planmyproject.workspaceOpen",
           "group": "navigation@2"
         },
         {
           "command": "planmyproject.rebuildQueue",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && planmyproject.workspaceOpen",
           "group": "navigation@3"
         }
       ],
