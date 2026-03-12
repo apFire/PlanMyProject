@@ -118,6 +118,7 @@ Behavior:
 - `Implement Task` requests JSON from Copilot and writes files to workspace
 - Supports create/update file writes (full-file content per path)
 - Rejects unsafe paths (absolute paths, `..`, external URIs)
+- Blocks writes that resolve outside workspace root (including symlink-escape ancestors)
 - If model output is invalid JSON, sends a repair request (with consent)
 - Marks selected task subtree done (`[x]`) after successful apply
 
@@ -153,7 +154,9 @@ Example:
 Behavior:
 - Activity bar view: `PlanMyProject` -> `Implementation Tree`
 - Click any tree item to drill into task line
-- Tree context menu provides Add/Plan/Implement/Drill/Delete
+- Tree context menu provides Add/Plan/Implement/Drill/Delete for normal items
+- Running request progress is shown on the active task item itself
+- Running task item exposes only `Cancel Active Request` inline action
 
 Example:
 ```text
@@ -174,7 +177,7 @@ Example:
 Open plan file -> every task line shows actions without editing markdown links
 ```
 
-### 10) Status propagation and progress visualization
+### 10) Status propagation and in-item progress visualization
 
 Behavior:
 - Supported statuses: `[ ]`, `[/]`, `[x]`
@@ -183,6 +186,8 @@ Behavior:
   - partial done -> `[/]`
   - none done -> `[ ]`
 - Tree icons mirror these statuses
+- Active Plan/Implement request overlays task icon/state (`loading`, `check`, `error`, `cancelled`)
+- Requests can be cancelled from tree inline action or `PlanMyProject: Cancel Active Request`
 
 Example:
 ```text
@@ -228,6 +233,7 @@ Result: extra "Apply Sensitive Changes" confirmation appears before write
 - `PlanMyProject: Delete Task`
 - `PlanMyProject: Rebuild Execution Queue`
 - `PlanMyProject: Refresh Tree`
+- `PlanMyProject: Cancel Active Request`
 
 ## Original Spec vs Current Implementation
 
@@ -252,6 +258,7 @@ Result: extra "Apply Sensitive Changes" confirmation appears before write
 - Copilot model selection uses first available model from VS Code LM API.
 - Requirement import scans root-level markdown files only.
 - Queue section is extension-generated and should not be manually maintained.
+- Only one active request is tracked/cancellable at a time.
 
 ## Feedback
 
@@ -293,3 +300,5 @@ If commands do not work as expected:
 - Added explicit Copilot consent and sensitive-write confirmation
 - Added repair retry path for invalid implementation JSON
 - Added tree view + CodeLens + gutter action surface for plan execution workflow
+- Added cancellable active-request flow with per-task tree progress/status
+- Added workspace-write hardening against symlink-escape paths
