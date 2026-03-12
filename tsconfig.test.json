@@ -10,6 +10,7 @@
   "include": [
     "src/implement.ts",
     "src/model.ts",
+    "src/tree.ts",
     "src/privacy.ts",
     "test/**/*.ts"
   ]

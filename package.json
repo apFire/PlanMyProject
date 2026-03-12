@@ -221,7 +221,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test:build": "tsc -p ./tsconfig.test.json",
-    "test": "npm run test:build && node --test out-test/test/**/*.test.js",
+    "test": "npm run test:build && NODE_PATH=./test/shims node --test out-test/test/**/*.test.js",
     "verify": "npm run compile && npm test",
     "package": "npx @vscode/vsce package --no-yarn --no-dependencies",
     "publish:vsce": "npx @vscode/vsce publish --no-yarn --no-dependencies"
