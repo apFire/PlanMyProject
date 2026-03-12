@@ -1,6 +1,15 @@
 # PlanMyProject
 
-Plan your project in one Markdown file, expand tasks with Copilot, and execute leaf tasks into real workspace file changes.
+Planning real engineering work is usually fragmented across notes, tickets, and chat. Execution drifts, priorities blur, and tasks lose context.
+
+PlanMyProject solves this by turning your workspace into a single planning-and-execution loop:
+
+- Keep one implementation plan in source control (`planmyproject.md` / `projectplan.md`)
+- Expand any task into actionable sub-tasks with Copilot
+- Auto-maintain an execution queue from leaf tasks
+- Implement selected tasks directly into workspace files with safety checks and approvals
+
+If you want to go from idea -> plan -> code without leaving VS Code, this extension is built for that workflow.
 
 ## Requirements
 
@@ -132,6 +141,8 @@ Example response format:
 
 - Activity Bar container: `PlanMyProject` -> `Implementation Tree`
 - Task actions in tree context menu: Add, Plan, Implement, Drill, Delete
+- While a request is running, the active task item shows live progress/status directly in that item
+- Running task item exposes `Cancel Active Request` and hides other inline actions
 - CodeLens on task lines: `Plan | Drill | Implement`
 - Click tree item to jump to task line (`Drill Down`)
 
@@ -142,11 +153,13 @@ Click [T0005] in Implementation Tree
 Result: editor jumps to [T0005] in plan file
 ```
 
-### 8) Status propagation and progress
+### 8) Status propagation and in-item progress
 
 - Status values: `[ ]`, `[/]`, `[x]`
 - Parent status is derived from child states
 - Leaf tasks get execute gutter icon; non-leaf tasks get planning icon
+- Plan/Implement progress is shown on the currently processed task item (spinner/check/error/cancel icons)
+- Active request can be cancelled from the task inline action or `PlanMyProject: Cancel Active Request`
 
 Example:
 
@@ -179,6 +192,7 @@ Result: [T0003] and descendants removed, queue updated
 - `PlanMyProject: Delete Task`
 - `PlanMyProject: Rebuild Execution Queue`
 - `PlanMyProject: Refresh Tree`
+- `PlanMyProject: Cancel Active Request`
 
 ## Privacy and Copilot Data Flow
 
@@ -203,6 +217,7 @@ When implementation JSON is valid and approved:
 - Safety:
   - workspace-relative paths only
   - rejects absolute paths and `..` traversal
+  - blocks writes that resolve outside workspace root (including symlink-escape ancestors)
   - if duplicate paths are returned, the last one wins
 - Not supported:
   - file deletion
