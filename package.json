@@ -38,7 +38,8 @@
     "workspace"
   ],
   "activationEvents": [
-    "onStartupFinished",
+    "workspaceContains:planmyproject.md",
+    "workspaceContains:projectplan.md",
     "onCommand:planmyproject.openPlan",
     "onCommand:planmyproject.planTask",
     "onCommand:planmyproject.addTask",
@@ -126,7 +127,7 @@
       {
         "command": "planmyproject.planTask",
         "key": "alt+p",
-        "when": "editorTextFocus && planmyproject.workspaceOpen"
+        "when": "editorTextFocus && workbenchState != 'empty'"
       }
     ],
     "viewsContainers": {

@@ -1,7 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ImplementationPayload, isSensitiveWorkspacePath, parseImplementationPayload } from "./implement";
-import { maskSensitiveText, streamCopilotText } from "./lm";
+import type { ImplementationPayload } from "./implement";
 import {
   TaskNode,
   collectAncestorChain,
@@ -17,6 +16,7 @@ import {
 import { PlanTreeProvider } from "./tree";
 
 const PLAN_FILENAMES = ["planmyproject.md", "projectplan.md"] as const;
+const ROOT_PLAN_GLOB = `{${PLAN_FILENAMES.join(",")}}`;
 const DEFAULT_PLAN_FILENAME = PLAN_FILENAMES[0];
 const MAX_IMPLEMENTATION_SNAPSHOTS = 8;
 const MAX_IMPLEMENTATION_FILE_CHARS = 14_000;
@@ -64,6 +64,8 @@ let executeDecorationType: vscode.TextEditorDecorationType;
 let internalWriteDepth = 0;
 let activePlanUri: vscode.Uri | undefined;
 let copilotConsentAllowAll = false;
+let implementModuleLoader: Promise<typeof import("./implement")> | undefined;
+let lmModuleLoader: Promise<typeof import("./lm")> | undefined;
 
 interface TaskCommandRef {
   taskId?: string;
@@ -76,6 +78,20 @@ interface FileSnapshot {
   truncated: boolean;
 }
 
+async function loadImplementModule(): Promise<typeof import("./implement")> {
+  if (!implementModuleLoader) {
+    implementModuleLoader = import("./implement");
+  }
+  return implementModuleLoader;
+}
+
+async function loadLmModule(): Promise<typeof import("./lm")> {
+  if (!lmModuleLoader) {
+    lmModuleLoader = import("./lm");
+  }
+  return lmModuleLoader;
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   treeProvider = new PlanTreeProvider();
   context.subscriptions.push(vscode.window.registerTreeDataProvider("planmyproject.tree", treeProvider));
@@ -83,7 +99,7 @@ export function activate(context: vscode.ExtensionContext): void {
   void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, true);
   context.subscriptions.push(
     vscode.languages.registerCodeLensProvider(
-      [{ scheme: "file", pattern: `**/{${PLAN_FILENAMES.join(",")}}` }],
+      [{ scheme: "file", pattern: ROOT_PLAN_GLOB }],
       new PlanCodeLensProvider()
     )
   );
@@ -168,7 +184,7 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  const watcher = vscode.workspace.createFileSystemWatcher(`**/{${PLAN_FILENAMES.join(",")}}`);
+  const watcher = vscode.workspace.createFileSystemWatcher(ROOT_PLAN_GLOB);
   context.subscriptions.push(
     watcher,
     watcher.onDidCreate(async (uri) => {
@@ -306,7 +322,8 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       let accumulated = "";
       let wroteAny = false;
       const prompt = buildPlanPrompt(target, ancestors, relatedFiles, existingChildren, mode);
-      const safePrompt = maskSensitiveText(prompt);
+      const lm = await loadLmModule();
+      const safePrompt = lm.maskSensitiveText(prompt);
       const allowPlanRequest = await requestCopilotConsent(`Plan task ${target.id}`, [
         `Selected task: [${target.id}] ${target.title}`,
         `Ancestor tasks included: ${ancestors.length}`,
@@ -325,7 +342,7 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       }
 
       progress.report({ message: "Requesting one-level plan from Copilot..." });
-      await streamCopilotText(
+      await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
           if (token.isCancellationRequested) {
@@ -466,7 +483,8 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
         MAX_IMPLEMENTATION_TOTAL_CHARS
       );
       const prompt = buildImplementPrompt(target, ancestors, relatedFiles, snapshots);
-      const safePrompt = maskSensitiveText(prompt);
+      const lm = await loadLmModule();
+      const safePrompt = lm.maskSensitiveText(prompt);
       const snapshotChars = snapshots.reduce((sum, snapshot) => sum + snapshot.content.length, 0);
       const allowImplementRequest = await requestCopilotConsent(`Implement task ${target.id}`, [
         `Selected task: [${target.id}] ${target.title}`,
@@ -482,7 +500,7 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
       let modelOutput = "";
 
       progress.report({ message: "Requesting implementation edits from Copilot..." });
-      await streamCopilotText(
+      await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
           if (token.isCancellationRequested) {
@@ -1239,8 +1257,9 @@ async function parseImplementationWithRepair(
   modelOutput: string,
   token: vscode.CancellationToken
 ): Promise<ImplementationPayload> {
+  const implement = await loadImplementModule();
   try {
-    return parseImplementationPayload(modelOutput);
+    return implement.parseImplementationPayload(modelOutput);
   } catch (firstError) {
     if (token.isCancellationRequested) {
       throw firstError;
@@ -1257,9 +1276,10 @@ async function parseImplementationWithRepair(
     }
 
     const repairPrompt = buildImplementRepairPrompt(modelOutput);
-    const safeRepairPrompt = maskSensitiveText(repairPrompt);
+    const lm = await loadLmModule();
+    const safeRepairPrompt = lm.maskSensitiveText(repairPrompt);
     let repaired = "";
-    await streamCopilotText(
+    await lm.streamCopilotText(
       safeRepairPrompt,
       async (chunk) => {
         if (token.isCancellationRequested) {
@@ -1269,7 +1289,7 @@ async function parseImplementationWithRepair(
       },
       token
     );
-    return parseImplementationPayload(repaired);
+    return implement.parseImplementationPayload(repaired);
   }
 }
 
@@ -1282,7 +1302,8 @@ async function applyImplementationChanges(payload: ImplementationPayload): Promi
     finalByPath.set(change.path, change.content);
   }
 
-  const sensitivePaths = Array.from(finalByPath.keys()).filter((relativePath) => isSensitiveWorkspacePath(relativePath));
+  const implement = await loadImplementModule();
+  const sensitivePaths = Array.from(finalByPath.keys()).filter((relativePath) => implement.isSensitiveWorkspacePath(relativePath));
   if (sensitivePaths.length > 0) {
     const approved = await requestSensitiveFileOverrideConsent(sensitivePaths);
     if (!approved) {
