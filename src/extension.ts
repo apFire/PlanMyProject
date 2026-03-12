@@ -40,6 +40,9 @@ const REQUIREMENT_FILE_HINTS = [
 const MAX_IMPORTED_ROOT_TASKS = 24;
 const MIN_IMPORT_TASK_LENGTH = 8;
 const MAX_IMPORT_TASK_LENGTH = 180;
+const TREE_REQUEST_SUCCESS_CLEAR_MS = 2_500;
+const TREE_REQUEST_CANCELLED_CLEAR_MS = 3_000;
+const TREE_REQUEST_ERROR_CLEAR_MS = 6_000;
 const NON_TASK_HEADING_TITLES = new Set([
   "overview",
   "introduction",
@@ -78,6 +81,13 @@ interface FileSnapshot {
   truncated: boolean;
 }
 
+interface TreeRequestContext {
+  token: vscode.CancellationToken;
+  report: (detail: string) => void;
+  complete: (detail: string) => void;
+  cancel: (detail: string) => void;
+}
+
 async function loadImplementModule(): Promise<typeof import("./implement")> {
   if (!implementModuleLoader) {
     implementModuleLoader = import("./implement");
@@ -94,6 +104,7 @@ async function loadLmModule(): Promise<typeof import("./lm")> {
 
 export function activate(context: vscode.ExtensionContext): void {
   treeProvider = new PlanTreeProvider();
+  context.subscriptions.push(treeProvider);
   context.subscriptions.push(vscode.window.registerTreeDataProvider("planmyproject.tree", treeProvider));
   updateWorkspaceContext();
   void vscode.commands.executeCommand("setContext", TREE_EMPTY_CONTEXT_KEY, true);
@@ -258,6 +269,54 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {}
 
+async function withTreeRequestProgress<T>(
+  title: string,
+  runner: (context: TreeRequestContext) => Promise<T>
+): Promise<T | undefined> {
+  const requestId = treeProvider.beginRequest(title, "Preparing request...");
+  const cancellation = new vscode.CancellationTokenSource();
+  let finalized = false;
+
+  const context: TreeRequestContext = {
+    token: cancellation.token,
+    report: (detail: string) => {
+      treeProvider.updateRequest(requestId, detail);
+    },
+    complete: (detail: string) => {
+      if (finalized) {
+        return;
+      }
+      finalized = true;
+      treeProvider.finishRequest(requestId, "success", detail, TREE_REQUEST_SUCCESS_CLEAR_MS);
+    },
+    cancel: (detail: string) => {
+      if (finalized) {
+        return;
+      }
+      finalized = true;
+      treeProvider.finishRequest(requestId, "cancelled", detail, TREE_REQUEST_CANCELLED_CLEAR_MS);
+    }
+  };
+
+  try {
+    const result = await runner(context);
+    if (!finalized) {
+      context.complete("Request completed.");
+    }
+    return result;
+  } catch (error) {
+    const message = toErrorMessage(error);
+    if (isCancellationMessage(message)) {
+      context.cancel(message);
+      return undefined;
+    }
+    treeProvider.finishRequest(requestId, "error", message, TREE_REQUEST_ERROR_CLEAR_MS);
+    throw error;
+  } finally {
+    cancellation.dispose();
+  }
+}
+
 async function handlePlanTask(arg?: unknown): Promise<void> {
   const taskRef = extractTaskCommandRef(arg);
   const doc = await resolvePlanDocumentForCommand(taskRef);
@@ -300,13 +359,9 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
     mode = selection.mode;
   }
 
-  await vscode.window.withProgress(
-    {
-      title: `Planning ${target.id}`,
-      location: vscode.ProgressLocation.Notification,
-      cancellable: true
-    },
-    async (progress, token) => {
+  try {
+    await withTreeRequestProgress(`Planning ${target.id}`, async (request) => {
+      request.report("Collecting task context...");
       const ancestors = collectAncestorChain(parsed.tasks, target.id);
       const relatedFiles = await collectRelevantFiles(target.title, 12);
       const existingChildren = target.children.map((child) => child.title);
@@ -324,6 +379,7 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       const prompt = buildPlanPrompt(target, ancestors, relatedFiles, existingChildren, mode);
       const lm = await loadLmModule();
       const safePrompt = lm.maskSensitiveText(prompt);
+      request.report("Awaiting Copilot consent...");
       const allowPlanRequest = await requestCopilotConsent(`Plan task ${target.id}`, [
         `Selected task: [${target.id}] ${target.title}`,
         `Ancestor tasks included: ${ancestors.length}`,
@@ -332,20 +388,21 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
         "Workspace file contents included: none"
       ]);
       if (!allowPlanRequest) {
-        vscode.window.showInformationMessage(`Cancelled planning ${target.id}. No data was sent to Copilot.`);
+        request.cancel(`Cancelled planning ${target.id}. No data was sent to Copilot.`);
         return;
       }
 
       if (mode === "replace") {
+        request.report("Replacing existing sub-tasks...");
         target.children = [];
         await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
       }
 
-      progress.report({ message: "Requesting one-level plan from Copilot..." });
+      request.report("Requesting one-level plan from Copilot...");
       await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
-          if (token.isCancellationRequested) {
+          if (request.token.isCancellationRequested) {
             return;
           }
           accumulated += chunk;
@@ -370,9 +427,9 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
           target.children = nextChildren;
           await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
           wroteAny = true;
-          progress.report({ message: `Streaming plan... ${generatedTitles.length} sub-task(s)` });
+          request.report(`Streaming plan... ${generatedTitles.length} sub-task(s)`);
         },
-        token
+        request.token
       );
 
       if (!wroteAny) {
@@ -384,11 +441,14 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
         await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
       }
 
+      request.report("Refreshing tree...");
       const latestDoc = await vscode.workspace.openTextDocument(doc.uri);
       await refreshFromDocument(latestDoc);
-      vscode.window.showInformationMessage(`Planned ${target.id} with one-level expansion.`);
-    }
-  );
+      request.complete(`Planned ${target.id} with ${target.children.length} sub-task(s).`);
+    });
+  } catch (error) {
+    vscode.window.showErrorMessage(`Failed planning ${target.id}: ${toErrorMessage(error)}`);
+  }
 }
 
 async function handleAddTask(arg?: unknown, forceRoot = false): Promise<void> {
@@ -467,13 +527,9 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
     return;
   }
 
-  await vscode.window.withProgress(
-    {
-      title: `Implementing ${target.id}`,
-      location: vscode.ProgressLocation.Notification,
-      cancellable: true
-    },
-    async (progress, token) => {
+  try {
+    await withTreeRequestProgress(`Implementing ${target.id}`, async (request) => {
+      request.report("Collecting implementation context...");
       const ancestors = collectAncestorChain(parsed.tasks, target.id);
       const relatedFiles = await collectRelevantFiles(target.title, 20);
       const snapshots = await collectRelevantFileSnapshots(
@@ -486,6 +542,7 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
       const lm = await loadLmModule();
       const safePrompt = lm.maskSensitiveText(prompt);
       const snapshotChars = snapshots.reduce((sum, snapshot) => sum + snapshot.content.length, 0);
+      request.report("Awaiting Copilot consent...");
       const allowImplementRequest = await requestCopilotConsent(`Implement task ${target.id}`, [
         `Selected task: [${target.id}] ${target.title}`,
         `Ancestor tasks included: ${ancestors.length}`,
@@ -494,25 +551,30 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
         `If parsing fails, a repair follow-up may send up to ${MAX_REPAIR_INPUT_CHARS.toLocaleString()} chars from Copilot output`
       ]);
       if (!allowImplementRequest) {
-        vscode.window.showInformationMessage(`Cancelled implementation for ${target.id}. No data was sent to Copilot.`);
+        request.cancel(`Cancelled implementation for ${target.id}. No data was sent to Copilot.`);
         return;
       }
-      let modelOutput = "";
 
-      progress.report({ message: "Requesting implementation edits from Copilot..." });
+      let modelOutput = "";
+      request.report("Requesting implementation edits from Copilot...");
       await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
-          if (token.isCancellationRequested) {
+          if (request.token.isCancellationRequested) {
             return;
           }
           modelOutput += chunk;
+          if (modelOutput.length > 0 && modelOutput.length % 1500 < chunk.length) {
+            request.report(`Receiving model output... ${modelOutput.length.toLocaleString()} chars`);
+          }
         },
-        token
+        request.token
       );
 
-      progress.report({ message: "Applying generated file changes..." });
-      const payload = await parseImplementationWithRepair(modelOutput, token);
+      request.report("Parsing and validating Copilot response...");
+      const payload = await parseImplementationWithRepair(modelOutput, request.token, request.report);
+
+      request.report("Applying generated file changes...");
       const writtenFiles = await applyImplementationChanges(payload);
 
       // Implement command represents completion for the selected feature scope.
@@ -528,11 +590,11 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
       }
 
       const summarySuffix = payload.summary ? ` ${payload.summary}` : "";
-      vscode.window.showInformationMessage(
-        `Implemented ${target.id}: wrote ${writtenFiles.length} file(s).${summarySuffix}`
-      );
-    }
-  );
+      request.complete(`Implemented ${target.id}: wrote ${writtenFiles.length} file(s).${summarySuffix}`);
+    });
+  } catch (error) {
+    vscode.window.showErrorMessage(`Failed implementing ${target.id}: ${toErrorMessage(error)}`);
+  }
 }
 
 async function handleDeleteTask(arg?: unknown): Promise<void> {
@@ -1122,6 +1184,20 @@ function toUri(candidate: unknown): vscode.Uri | undefined {
   return undefined;
 }
 
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  return "Unknown error.";
+}
+
+function isCancellationMessage(message: string): boolean {
+  return /^cancel(?:led)?\b/i.test(message.trim());
+}
+
 async function uriExists(uri: vscode.Uri): Promise<boolean> {
   try {
     await vscode.workspace.fs.stat(uri);
@@ -1255,7 +1331,8 @@ async function requestSensitiveFileOverrideConsent(paths: string[]): Promise<boo
 
 async function parseImplementationWithRepair(
   modelOutput: string,
-  token: vscode.CancellationToken
+  token: vscode.CancellationToken,
+  onStatus?: (detail: string) => void
 ): Promise<ImplementationPayload> {
   const implement = await loadImplementModule();
   try {
@@ -1265,6 +1342,7 @@ async function parseImplementationWithRepair(
       throw firstError;
     }
 
+    onStatus?.("Initial response was invalid JSON. Requesting repair...");
     const repairExcerptLength = Math.min(modelOutput.length, MAX_REPAIR_INPUT_CHARS);
     const allowRepairRequest = await requestCopilotConsent("Repair implementation response", [
       "Reason: the first Copilot response was not valid JSON.",
@@ -1279,6 +1357,7 @@ async function parseImplementationWithRepair(
     const lm = await loadLmModule();
     const safeRepairPrompt = lm.maskSensitiveText(repairPrompt);
     let repaired = "";
+    onStatus?.("Waiting for repaired JSON response from Copilot...");
     await lm.streamCopilotText(
       safeRepairPrompt,
       async (chunk) => {
