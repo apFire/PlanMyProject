@@ -3,46 +3,50 @@ import assert from "node:assert/strict";
 import { makeTaskNode } from "../src/model";
 import { PlanTreeProvider, TaskTreeItem } from "../src/tree";
 
-test("PlanTreeProvider exposes running request status item before tasks", () => {
+test("PlanTreeProvider decorates active task item with running status", () => {
   const provider = new PlanTreeProvider();
   const root = makeTaskNode("T0001", "Build authentication", 0, null);
   provider.setTasks([root]);
 
-  const requestId = provider.beginRequest("Planning T0001", "Preparing request...");
-  provider.updateRequest(requestId, "Streaming plan...");
+  const requestId = provider.beginTaskRequest("T0001", "Preparing request...");
+  provider.updateTaskRequest(requestId, "Streaming plan...");
 
   const rootChildren = provider.getChildren();
   assert.ok(Array.isArray(rootChildren));
-  assert.equal(rootChildren.length, 2);
+  assert.equal(rootChildren.length, 1);
 
-  const statusItem = rootChildren[0] as Record<string, unknown>;
-  assert.equal(statusItem.label, "Planning T0001");
-  assert.equal(statusItem.description, "Streaming plan...");
-  assert.equal((statusItem.iconPath as { id?: string }).id, "loading~spin");
-  assert.equal((statusItem.command as { command?: string }).command, "planmyproject.cancelActiveRequest");
-  assert.equal(statusItem.contextValue, "requestStatusRunning");
+  const activeItem = rootChildren[0];
+  assert.equal(activeItem.label, "Build authentication");
+  assert.match(String(activeItem.description), /T0001/);
+  assert.match(String(activeItem.description), /Streaming plan/);
+  assert.equal((activeItem.iconPath as { id?: string }).id, "loading~spin");
+  assert.equal((activeItem.command as { command?: string }).command, "planmyproject.drillDown");
+  assert.equal(activeItem.contextValue, "activeRequestTaskRunning");
   provider.dispose();
 });
 
-test("PlanTreeProvider can finish and clear request status", () => {
+test("PlanTreeProvider restores normal task context after request clears", () => {
   const provider = new PlanTreeProvider();
   const root = makeTaskNode("T0001", "Build authentication", 0, null);
   provider.setTasks([root]);
 
-  const requestId = provider.beginRequest("Planning T0001", "Preparing request...");
-  provider.finishRequest(requestId, "success", "Done.", 500);
+  const requestId = provider.beginTaskRequest("T0001", "Preparing request...");
+  provider.finishTaskRequest(requestId, "success", "Done.", 500);
 
-  const withStatus = provider.getChildren();
-  assert.ok(Array.isArray(withStatus));
-  assert.equal(withStatus.length, 2);
-  const statusItem = withStatus[0] as Record<string, unknown>;
-  assert.equal((statusItem.iconPath as { id?: string }).id, "check");
-  assert.equal(statusItem.contextValue, "requestStatus");
+  const whileStatusActive = provider.getChildren();
+  assert.ok(Array.isArray(whileStatusActive));
+  assert.equal(whileStatusActive.length, 1);
+  const requestItem = whileStatusActive[0];
+  assert.equal((requestItem.iconPath as { id?: string }).id, "check");
+  assert.equal(requestItem.contextValue, "leafTask");
 
-  provider.clearRequest(requestId);
+  provider.clearTaskRequest(requestId);
   const afterClear = provider.getChildren();
   assert.ok(Array.isArray(afterClear));
   assert.equal(afterClear.length, 1);
+  const normalItem = afterClear[0];
+  assert.equal((normalItem.iconPath as { id?: string }).id, "circle-large-outline");
+  assert.equal(normalItem.contextValue, "leafTask");
   provider.dispose();
 });
 

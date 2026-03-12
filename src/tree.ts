@@ -3,22 +3,20 @@ import { TaskNode } from "./model";
 
 type RequestState = "running" | "success" | "error" | "cancelled";
 
-interface RequestStatus {
+interface TaskRequestStatus {
   requestId: number;
-  title: string;
+  taskId: string;
   detail: string;
   state: RequestState;
 }
 
-type PlanTreeElement = TaskTreeItem | RequestStatusTreeItem;
-
-export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeElement>, vscode.Disposable {
-  private readonly emitter = new vscode.EventEmitter<PlanTreeElement | undefined>();
+export class PlanTreeProvider implements vscode.TreeDataProvider<TaskTreeItem>, vscode.Disposable {
+  private readonly emitter = new vscode.EventEmitter<TaskTreeItem | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
 
   private roots: TaskNode[] = [];
   private sourceUri?: vscode.Uri;
-  private requestStatus?: RequestStatus;
+  private requestStatus?: TaskRequestStatus;
   private nextRequestId = 0;
   private clearTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -28,15 +26,15 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeElement
     this.refresh();
   }
 
-  beginRequest(title: string, detail: string): number {
+  beginTaskRequest(taskId: string, detail: string): number {
     this.clearScheduledRequestClear();
     const requestId = ++this.nextRequestId;
-    this.requestStatus = { requestId, title, detail, state: "running" };
+    this.requestStatus = { requestId, taskId, detail, state: "running" };
     this.refresh();
     return requestId;
   }
 
-  updateRequest(requestId: number, detail: string): void {
+  updateTaskRequest(requestId: number, detail: string): void {
     if (!this.requestStatus || this.requestStatus.requestId !== requestId) {
       return;
     }
@@ -47,20 +45,20 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeElement
     this.refresh();
   }
 
-  finishRequest(requestId: number, state: Exclude<RequestState, "running">, detail: string, clearAfterMs = 0): void {
+  finishTaskRequest(requestId: number, state: Exclude<RequestState, "running">, detail: string, clearAfterMs = 0): void {
     if (!this.requestStatus || this.requestStatus.requestId !== requestId) {
       return;
     }
     this.requestStatus = { ...this.requestStatus, state, detail };
     this.refresh();
-    this.clearRequest(requestId, clearAfterMs);
+    this.clearTaskRequest(requestId, clearAfterMs);
   }
 
-  clearRequest(requestId?: number, delayMs = 0): void {
+  clearTaskRequest(requestId?: number, delayMs = 0): void {
     if (delayMs > 0) {
       this.clearScheduledRequestClear();
       this.clearTimer = setTimeout(() => {
-        this.clearRequest(requestId, 0);
+        this.clearTaskRequest(requestId, 0);
       }, delayMs);
       return;
     }
@@ -79,23 +77,20 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeElement
     this.emitter.fire(undefined);
   }
 
-  getTreeItem(element: PlanTreeElement): vscode.TreeItem {
+  getTreeItem(element: TaskTreeItem): vscode.TreeItem {
     return element;
   }
 
-  getChildren(element?: PlanTreeElement): vscode.ProviderResult<PlanTreeElement[]> {
-    if (element instanceof TaskTreeItem) {
-      return element.task.children.map((task) => new TaskTreeItem(task, this.sourceUri));
-    }
-    if (element instanceof RequestStatusTreeItem) {
-      return [];
-    }
+  getChildren(element?: TaskTreeItem): vscode.ProviderResult<TaskTreeItem[]> {
+    const source = element ? element.task.children : this.roots;
+    return source.map((task) => this.makeTaskItem(task));
+  }
 
-    const taskItems = this.roots.map((task) => new TaskTreeItem(task, this.sourceUri));
-    if (!this.requestStatus) {
-      return taskItems;
-    }
-    return [new RequestStatusTreeItem(this.requestStatus), ...taskItems];
+  private makeTaskItem(task: TaskNode): TaskTreeItem {
+    const taskRequest = this.requestStatus && this.requestStatus.taskId === task.id
+      ? this.requestStatus
+      : undefined;
+    return new TaskTreeItem(task, this.sourceUri, taskRequest);
   }
 
   dispose(): void {
@@ -113,12 +108,18 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeElement
 }
 
 export class TaskTreeItem extends vscode.TreeItem {
-  constructor(readonly task: TaskNode, sourceUri?: vscode.Uri) {
+  constructor(readonly task: TaskNode, sourceUri?: vscode.Uri, request?: TaskRequestStatus) {
     super(summarizeTitle(task.title), task.children.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
     this.id = task.id;
-    this.description = task.id;
-    this.tooltip = `${task.id} [${task.status}]\n${task.title}`;
-    this.contextValue = task.children.length === 0 ? "leafTask" : "taskNode";
+    this.description = request ? `${task.id} • ${summarizeStatusDetail(request.detail)}` : task.id;
+    this.tooltip = request
+      ? `${task.id} [${task.status}]\n${task.title}\n\n${request.detail}`
+      : `${task.id} [${task.status}]\n${task.title}`;
+    this.contextValue = request?.state === "running"
+      ? "activeRequestTaskRunning"
+      : task.children.length === 0
+        ? "leafTask"
+        : "taskNode";
     this.command = {
       command: "planmyproject.drillDown",
       title: "Drill Down",
@@ -127,24 +128,7 @@ export class TaskTreeItem extends vscode.TreeItem {
     if (sourceUri) {
       this.resourceUri = sourceUri;
     }
-    this.iconPath = iconForStatus(task.status);
-  }
-}
-
-class RequestStatusTreeItem extends vscode.TreeItem {
-  constructor(status: RequestStatus) {
-    super(status.title, vscode.TreeItemCollapsibleState.None);
-    this.id = `planmyproject.request.${status.requestId}`;
-    this.contextValue = status.state === "running" ? "requestStatusRunning" : "requestStatus";
-    this.description = summarizeStatusDetail(status.detail);
-    this.tooltip = `${status.title}\n${status.detail}`;
-    this.iconPath = iconForRequestState(status.state);
-    if (status.state === "running") {
-      this.command = {
-        command: "planmyproject.cancelActiveRequest",
-        title: "Cancel Active Request"
-      };
-    }
+    this.iconPath = request ? iconForRequestState(request.state) : iconForStatus(task.status);
   }
 }
 

@@ -278,10 +278,10 @@ export function activate(context: vscode.ExtensionContext): void {
 export function deactivate(): void {}
 
 async function withTreeRequestProgress<T>(
-  title: string,
+  taskId: string,
   runner: (context: TreeRequestContext) => Promise<T>
 ): Promise<T | undefined> {
-  const requestId = treeProvider.beginRequest(title, "Preparing request...");
+  const requestId = treeProvider.beginTaskRequest(taskId, "Preparing request...");
   const cancellation = new vscode.CancellationTokenSource();
   activeRequestCancellation = cancellation;
   let finalized = false;
@@ -289,21 +289,21 @@ async function withTreeRequestProgress<T>(
   const context: TreeRequestContext = {
     token: cancellation.token,
     report: (detail: string) => {
-      treeProvider.updateRequest(requestId, detail);
+      treeProvider.updateTaskRequest(requestId, detail);
     },
     complete: (detail: string) => {
       if (finalized) {
         return;
       }
       finalized = true;
-      treeProvider.finishRequest(requestId, "success", detail, TREE_REQUEST_SUCCESS_CLEAR_MS);
+      treeProvider.finishTaskRequest(requestId, "success", detail, TREE_REQUEST_SUCCESS_CLEAR_MS);
     },
     cancel: (detail: string) => {
       if (finalized) {
         return;
       }
       finalized = true;
-      treeProvider.finishRequest(requestId, "cancelled", detail, TREE_REQUEST_CANCELLED_CLEAR_MS);
+      treeProvider.finishTaskRequest(requestId, "cancelled", detail, TREE_REQUEST_CANCELLED_CLEAR_MS);
     }
   };
 
@@ -319,7 +319,7 @@ async function withTreeRequestProgress<T>(
       context.cancel(message);
       return undefined;
     }
-    treeProvider.finishRequest(requestId, "error", message, TREE_REQUEST_ERROR_CLEAR_MS);
+    treeProvider.finishTaskRequest(requestId, "error", message, TREE_REQUEST_ERROR_CLEAR_MS);
     throw error;
   } finally {
     if (activeRequestCancellation === cancellation) {
@@ -372,7 +372,7 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
   }
 
   try {
-    await withTreeRequestProgress(`Planning ${target.id}`, async (request) => {
+    await withTreeRequestProgress(target.id, async (request) => {
       request.report("Collecting task context...");
       const ancestors = collectAncestorChain(parsed.tasks, target.id);
       const relatedFiles = await collectRelevantFiles(target.title, 12);
@@ -540,7 +540,7 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
   }
 
   try {
-    await withTreeRequestProgress(`Implementing ${target.id}`, async (request) => {
+    await withTreeRequestProgress(target.id, async (request) => {
       request.report("Collecting implementation context...");
       const ancestors = collectAncestorChain(parsed.tasks, target.id);
       const relatedFiles = await collectRelevantFiles(target.title, 20);

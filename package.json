@@ -125,7 +125,11 @@
       },
       {
         "command": "planmyproject.cancelActiveRequest",
-        "title": "PlanMyProject: Cancel Active Request"
+        "title": "PlanMyProject: Cancel Active Request",
+        "icon": {
+          "light": "media/cancel.svg",
+          "dark": "media/cancel.svg"
+        }
       }
     ],
     "keybindings": [
@@ -185,32 +189,32 @@
       "view/item/context": [
         {
           "command": "planmyproject.addTask",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && viewItem != activeRequestTaskRunning",
           "group": "inline@1"
         },
         {
           "command": "planmyproject.planTask",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && viewItem != activeRequestTaskRunning",
           "group": "inline@2"
         },
         {
           "command": "planmyproject.implementTask",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && viewItem != activeRequestTaskRunning",
           "group": "inline@3"
         },
         {
           "command": "planmyproject.drillDown",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && viewItem != activeRequestTaskRunning",
           "group": "inline@4"
         },
         {
           "command": "planmyproject.deleteTask",
-          "when": "view == planmyproject.tree",
+          "when": "view == planmyproject.tree && viewItem != activeRequestTaskRunning",
           "group": "inline@5"
         },
         {
           "command": "planmyproject.cancelActiveRequest",
-          "when": "view == planmyproject.tree && viewItem == requestStatusRunning",
+          "when": "view == planmyproject.tree && viewItem == activeRequestTaskRunning",
           "group": "inline@0"
         }
       ]
