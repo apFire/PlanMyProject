@@ -135,10 +135,16 @@ class RequestStatusTreeItem extends vscode.TreeItem {
   constructor(status: RequestStatus) {
     super(status.title, vscode.TreeItemCollapsibleState.None);
     this.id = `planmyproject.request.${status.requestId}`;
-    this.contextValue = "requestStatus";
+    this.contextValue = status.state === "running" ? "requestStatusRunning" : "requestStatus";
     this.description = summarizeStatusDetail(status.detail);
     this.tooltip = `${status.title}\n${status.detail}`;
     this.iconPath = iconForRequestState(status.state);
+    if (status.state === "running") {
+      this.command = {
+        command: "planmyproject.cancelActiveRequest",
+        title: "Cancel Active Request"
+      };
+    }
   }
 }
 

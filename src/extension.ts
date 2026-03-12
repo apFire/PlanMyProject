@@ -68,6 +68,7 @@ let executeDecorationType: vscode.TextEditorDecorationType;
 let internalWriteDepth = 0;
 let activePlanUri: vscode.Uri | undefined;
 let copilotConsentAllowAll = false;
+let activeRequestCancellation: vscode.CancellationTokenSource | undefined;
 let implementModuleLoader: Promise<typeof import("./implement")> | undefined;
 let lmModuleLoader: Promise<typeof import("./lm")> | undefined;
 
@@ -193,6 +194,12 @@ export function activate(context: vscode.ExtensionContext): void {
       if (doc) {
         await refreshFromDocument(doc);
       }
+    }),
+    vscode.commands.registerCommand("planmyproject.cancelActiveRequest", () => {
+      if (!activeRequestCancellation) {
+        return;
+      }
+      activeRequestCancellation.cancel();
     })
   );
 
@@ -276,6 +283,7 @@ async function withTreeRequestProgress<T>(
 ): Promise<T | undefined> {
   const requestId = treeProvider.beginRequest(title, "Preparing request...");
   const cancellation = new vscode.CancellationTokenSource();
+  activeRequestCancellation = cancellation;
   let finalized = false;
 
   const context: TreeRequestContext = {
@@ -314,6 +322,9 @@ async function withTreeRequestProgress<T>(
     treeProvider.finishRequest(requestId, "error", message, TREE_REQUEST_ERROR_CLEAR_MS);
     throw error;
   } finally {
+    if (activeRequestCancellation === cancellation) {
+      activeRequestCancellation = undefined;
+    }
     cancellation.dispose();
   }
 }
@@ -403,9 +414,7 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
-          if (request.token.isCancellationRequested) {
-            return;
-          }
+          throwIfCancelled(request.token);
           accumulated += chunk;
           const titles = parseAiTaskTitles(accumulated).slice(0, 8);
           const changed = titles.length !== generatedTitles.length || titles.some((value, index) => value !== generatedTitles[index]);
@@ -432,8 +441,10 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
         },
         request.token
       );
+      throwIfCancelled(request.token);
 
       if (!wroteAny) {
+        throwIfCancelled(request.token);
         const fallbackTitles = parseAiTaskTitles(accumulated);
         if (fallbackTitles.length === 0) {
           throw new Error("Copilot response did not contain parseable task bullets.");
@@ -561,9 +572,7 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
       await lm.streamCopilotText(
         safePrompt,
         async (chunk) => {
-          if (request.token.isCancellationRequested) {
-            return;
-          }
+          throwIfCancelled(request.token);
           modelOutput += chunk;
           if (modelOutput.length > 0 && modelOutput.length % 1500 < chunk.length) {
             request.report(`Receiving model output... ${modelOutput.length.toLocaleString()} chars`);
@@ -571,9 +580,11 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
         },
         request.token
       );
+      throwIfCancelled(request.token);
 
       request.report("Parsing and validating Copilot response...");
       const payload = await parseImplementationWithRepair(modelOutput, request.token, request.report);
+      throwIfCancelled(request.token);
 
       request.report("Applying generated file changes...");
       const writtenFiles = await applyImplementationChanges(payload);
@@ -1199,6 +1210,12 @@ function isCancellationMessage(message: string): boolean {
   return /^cancel(?:led)?\b/i.test(message.trim());
 }
 
+function throwIfCancelled(token: vscode.CancellationToken): void {
+  if (token.isCancellationRequested) {
+    throw new Error("Cancelled by user.");
+  }
+}
+
 async function uriExists(uri: vscode.Uri): Promise<boolean> {
   try {
     await vscode.workspace.fs.stat(uri);
@@ -1335,6 +1352,7 @@ async function parseImplementationWithRepair(
   token: vscode.CancellationToken,
   onStatus?: (detail: string) => void
 ): Promise<ImplementationPayload> {
+  throwIfCancelled(token);
   const implement = await loadImplementModule();
   try {
     return implement.parseImplementationPayload(modelOutput);
@@ -1362,13 +1380,12 @@ async function parseImplementationWithRepair(
     await lm.streamCopilotText(
       safeRepairPrompt,
       async (chunk) => {
-        if (token.isCancellationRequested) {
-          return;
-        }
+        throwIfCancelled(token);
         repaired += chunk;
       },
       token
     );
+    throwIfCancelled(token);
     return implement.parseImplementationPayload(repaired);
   }
 }
