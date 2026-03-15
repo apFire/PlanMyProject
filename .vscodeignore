@@ -3,6 +3,7 @@ test/**
 tsconfig.json
 tsconfig.test.json
 out-test/**
+scripts/**
 **/*.map
 **/*.ts
 project.md
