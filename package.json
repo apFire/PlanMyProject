@@ -225,12 +225,15 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run build",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "test:build": "tsc -p ./tsconfig.test.json",
     "test": "npm run test:build && NODE_PATH=./test/shims node --test out-test/test/**/*.test.js",
-    "verify": "npm run compile && npm test",
+    "test:coverage": "npm run test:build && NODE_PATH=./test/shims node --test --experimental-test-coverage out-test/test/**/*.test.js",
+    "build": "node ./scripts/update-readme-build-status.js",
+    "build:status": "npm run build",
+    "verify": "npm run build",
     "package": "npx @vscode/vsce package --no-yarn --no-dependencies",
     "publish:vsce": "npx @vscode/vsce publish --no-yarn --no-dependencies"
   },
