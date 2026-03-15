@@ -3,7 +3,7 @@
   "displayName": "Plan My Project",
   "description": "Unified project planning AI expansion and task execution.",
   "icon": "media/marketplace-icon.png",
-  "version": "0.1.2",
+  "version": "1.0.0",
   "publisher": "aypande",
   "license": "MIT",
   "repository": {
