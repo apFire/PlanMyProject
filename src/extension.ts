@@ -1,8 +1,8 @@
-import { promises as fs } from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import type { ImplementationPayload } from "./implement";
 import {
+  type ParsedPlan,
   TaskNode,
   collectAncestorChain,
   createTaskIdGenerator,
@@ -12,13 +12,37 @@ import {
   makeTaskNode,
   parseAiTaskTitles,
   parsePlanMarkdown,
-  serializePlanMarkdown
+  serializePlanMarkdown,
+  walkTasks
 } from "./model";
+import {
+  PLAN_FILENAMES,
+  ROOT_PLAN_GLOB,
+  TaskCommandRef,
+  ensurePlanDocument,
+  extractTaskCommandRef,
+  findExistingPlanDocument,
+  getWorkspaceRootUri,
+  isPlanDocument,
+  resolvePlanDocumentForCommand
+} from "./planFile";
+import {
+  buildImplementPrompt,
+  buildImplementRepairPrompt,
+  buildPlanPrompt
+} from "./prompts";
+import {
+  buildConsolidatedRequirementTitle,
+  extractRootTaskCandidates,
+  hasExplicitRequirementList,
+  hasImportableMarkdownRequirements
+} from "./requirements";
 import { PlanTreeProvider } from "./tree";
-
-const PLAN_FILENAMES = ["planmyproject.md", "projectplan.md"] as const;
-const ROOT_PLAN_GLOB = `{${PLAN_FILENAMES.join(",")}}`;
-const DEFAULT_PLAN_FILENAME = PLAN_FILENAMES[0];
+import {
+  collectRelevantFileSnapshots,
+  collectRelevantFiles,
+  resolveWorkspaceWriteTargetUri
+} from "./workspace";
 const MAX_IMPLEMENTATION_SNAPSHOTS = 8;
 const MAX_IMPLEMENTATION_FILE_CHARS = 14_000;
 const MAX_IMPLEMENTATION_TOTAL_CHARS = 52_000;
@@ -38,29 +62,9 @@ const REQUIREMENT_FILE_HINTS = [
   "specification.md",
   "readme.md"
 ] as const;
-const MAX_IMPORTED_ROOT_TASKS = 24;
-const MIN_IMPORT_TASK_LENGTH = 8;
-const MAX_IMPORT_TASK_LENGTH = 180;
 const TREE_REQUEST_SUCCESS_CLEAR_MS = 2_500;
 const TREE_REQUEST_CANCELLED_CLEAR_MS = 3_000;
 const TREE_REQUEST_ERROR_CLEAR_MS = 6_000;
-const NON_TASK_HEADING_TITLES = new Set([
-  "overview",
-  "introduction",
-  "background",
-  "context",
-  "goals",
-  "non goals",
-  "non-goals",
-  "requirements",
-  "functional requirements",
-  "non functional requirements",
-  "non-functional requirements",
-  "acceptance criteria",
-  "notes",
-  "appendix",
-  "summary"
-]);
 
 let treeProvider: PlanTreeProvider;
 let planDecorationType: vscode.TextEditorDecorationType;
@@ -71,17 +75,7 @@ let copilotConsentAllowAll = false;
 let activeRequestCancellation: vscode.CancellationTokenSource | undefined;
 let implementModuleLoader: Promise<typeof import("./implement")> | undefined;
 let lmModuleLoader: Promise<typeof import("./lm")> | undefined;
-
-interface TaskCommandRef {
-  taskId?: string;
-  fileUri?: vscode.Uri;
-}
-
-interface FileSnapshot {
-  path: string;
-  content: string;
-  truncated: boolean;
-}
+const parsedPlanCache = new Map<string, { version: number; parsed: ParsedPlan }>();
 
 interface TreeRequestContext {
   token: vscode.CancellationToken;
@@ -102,6 +96,65 @@ async function loadLmModule(): Promise<typeof import("./lm")> {
     lmModuleLoader = import("./lm");
   }
   return lmModuleLoader;
+}
+
+function getCachedParsedPlan(document: vscode.TextDocument): ParsedPlan {
+  const cacheKey = document.uri.toString();
+  const cached = parsedPlanCache.get(cacheKey);
+  if (cached && cached.version === document.version) {
+    return cached.parsed;
+  }
+
+  const parsed = parsePlanMarkdown(document.getText());
+  parsedPlanCache.set(cacheKey, { version: document.version, parsed });
+  return parsed;
+}
+
+function clearCachedParsedPlan(uri?: vscode.Uri): void {
+  if (!uri) {
+    parsedPlanCache.clear();
+    return;
+  }
+  parsedPlanCache.delete(uri.toString());
+}
+
+async function loadPlanCommandContext(arg?: unknown): Promise<{
+  taskRef: TaskCommandRef;
+  doc: vscode.TextDocument;
+  parsed: ParsedPlan;
+}> {
+  const taskRef = extractTaskCommandRef(arg);
+  const doc = await resolvePlanDocumentForCommand(taskRef, activePlanUri);
+  return { taskRef, doc, parsed: parsePlanMarkdown(doc.getText()) };
+}
+
+function resolveTaskTarget(
+  parsed: ParsedPlan,
+  taskRef: TaskCommandRef,
+  editor?: vscode.TextEditor
+): TaskNode | undefined {
+  if (taskRef.taskId) {
+    return findTaskById(parsed.tasks, taskRef.taskId);
+  }
+  if (editor && isPlanDocument(editor.document)) {
+    return findTaskByLine(parsed.tasks, editor.selection.active.line);
+  }
+  return undefined;
+}
+
+function getActivePlanEditor(): vscode.TextEditor | undefined {
+  const editor = vscode.window.activeTextEditor;
+  return editor && isPlanDocument(editor.document) ? editor : undefined;
+}
+
+async function refreshPlanUri(uri: vscode.Uri): Promise<void> {
+  await refreshFromDocument(await vscode.workspace.openTextDocument(uri));
+}
+
+async function writeAndRefreshPlan(uri: vscode.Uri, text: string): Promise<vscode.TextDocument> {
+  const latest = await writePlanContent(uri, text);
+  await refreshFromDocument(latest);
+  return latest;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -127,74 +180,46 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   context.subscriptions.push(planDecorationType, executeDecorationType);
 
-  context.subscriptions.push(
-    vscode.commands.registerCommand("planmyproject.openPlan", async () => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      const doc = await ensurePlanDocument();
-      await vscode.window.showTextDocument(doc, { preview: false });
+  const registerWorkspaceCommand = (
+    command: string,
+    handler: (arg?: unknown) => Promise<void>
+  ): void => {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(command, async (arg?: unknown) => {
+        if (!ensureWorkspaceFolderOpen()) {
+          return;
+        }
+        await handler(arg);
+      })
+    );
+  };
+
+  registerWorkspaceCommand("planmyproject.openPlan", async () => {
+    const doc = await ensurePlanDocument();
+    await vscode.window.showTextDocument(doc, { preview: false });
+    await refreshFromDocument(doc);
+  });
+  registerWorkspaceCommand("planmyproject.planTask", handlePlanTask);
+  registerWorkspaceCommand("planmyproject.addTask", handleAddTask);
+  registerWorkspaceCommand("planmyproject.addRootTask", async () => {
+    await handleAddTask(undefined, true);
+  });
+  registerWorkspaceCommand("planmyproject.loadRequirementsFile", handleLoadRequirementsFile);
+  registerWorkspaceCommand("planmyproject.drillDown", handleDrillDown);
+  registerWorkspaceCommand("planmyproject.implementTask", handleImplementTask);
+  registerWorkspaceCommand("planmyproject.deleteTask", handleDeleteTask);
+  registerWorkspaceCommand("planmyproject.rebuildQueue", async () => {
+    const doc = await resolvePlanDocumentForCommand(undefined, activePlanUri);
+    await syncExecutionQueue(doc);
+    await refreshPlanUri(doc.uri);
+  });
+  registerWorkspaceCommand("planmyproject.refreshTree", async () => {
+    const doc = await findExistingPlanDocument();
+    if (doc) {
       await refreshFromDocument(doc);
-    }),
-    vscode.commands.registerCommand("planmyproject.planTask", async (arg?: unknown) => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handlePlanTask(arg);
-    }),
-    vscode.commands.registerCommand("planmyproject.addTask", async (arg?: unknown) => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleAddTask(arg);
-    }),
-    vscode.commands.registerCommand("planmyproject.addRootTask", async () => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleAddTask(undefined, true);
-    }),
-    vscode.commands.registerCommand("planmyproject.loadRequirementsFile", async () => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleLoadRequirementsFile();
-    }),
-    vscode.commands.registerCommand("planmyproject.drillDown", async (arg?: unknown) => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleDrillDown(arg);
-    }),
-    vscode.commands.registerCommand("planmyproject.implementTask", async (arg?: unknown) => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleImplementTask(arg);
-    }),
-    vscode.commands.registerCommand("planmyproject.deleteTask", async (arg?: unknown) => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      await handleDeleteTask(arg);
-    }),
-    vscode.commands.registerCommand("planmyproject.rebuildQueue", async () => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      const doc = await resolvePlanDocumentForCommand();
-      await syncExecutionQueue(doc);
-      await refreshFromDocument(await vscode.workspace.openTextDocument(doc.uri));
-    }),
-    vscode.commands.registerCommand("planmyproject.refreshTree", async () => {
-      if (!ensureWorkspaceFolderOpen()) {
-        return;
-      }
-      const doc = await findExistingPlanDocument();
-      if (doc) {
-        await refreshFromDocument(doc);
-      }
-    }),
+    }
+  });
+  context.subscriptions.push(
     vscode.commands.registerCommand("planmyproject.cancelActiveRequest", () => {
       if (!activeRequestCancellation) {
         return;
@@ -206,15 +231,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const watcher = vscode.workspace.createFileSystemWatcher(ROOT_PLAN_GLOB);
   context.subscriptions.push(
     watcher,
-    watcher.onDidCreate(async (uri) => {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await refreshFromDocument(doc);
-    }),
-    watcher.onDidChange(async (uri) => {
-      const doc = await vscode.workspace.openTextDocument(uri);
-      await refreshFromDocument(doc);
-    }),
-    watcher.onDidDelete(async () => {
+    watcher.onDidCreate(refreshPlanUri),
+    watcher.onDidChange(refreshPlanUri),
+    watcher.onDidDelete(async (uri) => {
+      clearCachedParsedPlan(uri);
       const doc = await findExistingPlanDocument();
       if (doc) {
         await refreshFromDocument(doc);
@@ -249,6 +269,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!isPlanDocument(event.document)) {
         return;
       }
+      clearCachedParsedPlan(event.document.uri);
       await refreshFromDocument(event.document);
     }),
     vscode.workspace.onDidSaveTextDocument(async (document) => {
@@ -256,8 +277,10 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       await syncExecutionQueue(document);
-      const latest = await vscode.workspace.openTextDocument(document.uri);
-      await refreshFromDocument(latest);
+      await refreshPlanUri(document.uri);
+    }),
+    vscode.workspace.onDidCloseTextDocument((document) => {
+      clearCachedParsedPlan(document.uri);
     }),
     vscode.window.onDidChangeActiveTextEditor(async (editor) => {
       if (editor && isPlanDocument(editor.document)) {
@@ -330,8 +353,7 @@ async function withTreeRequestProgress<T>(
 }
 
 async function handlePlanTask(arg?: unknown): Promise<void> {
-  const taskRef = extractTaskCommandRef(arg);
-  const doc = await resolvePlanDocumentForCommand(taskRef);
+  const { taskRef, doc } = await loadPlanCommandContext(arg);
   const editor = await vscode.window.showTextDocument(doc, { preview: false });
   let parsed = parsePlanMarkdown(doc.getText());
 
@@ -344,12 +366,11 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       return;
     }
     const root = makeTaskNode("T0001", objective, 0, null);
-    await writePlanContent(doc.uri, serializePlanMarkdown([root]));
-    parsed = parsePlanMarkdown((await vscode.workspace.openTextDocument(doc.uri)).getText());
+    const latest = await writeAndRefreshPlan(doc.uri, serializePlanMarkdown([root]));
+    parsed = parsePlanMarkdown(latest.getText());
   }
 
-  const taskId = taskRef.taskId;
-  const target = taskId ? findTaskById(parsed.tasks, taskId) : findTaskByLine(parsed.tasks, editor.selection.active.line);
+  const target = resolveTaskTarget(parsed, taskRef, editor);
 
   if (!target) {
     vscode.window.showErrorMessage("No task found. Place the cursor on a task line or invoke from a task action.");
@@ -454,8 +475,7 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
       }
 
       request.report("Refreshing tree...");
-      const latestDoc = await vscode.workspace.openTextDocument(doc.uri);
-      await refreshFromDocument(latestDoc);
+      await refreshPlanUri(doc.uri);
       request.complete(`Planned ${target.id} with ${target.children.length} sub-task(s).`);
     });
   } catch (error) {
@@ -464,18 +484,8 @@ async function handlePlanTask(arg?: unknown): Promise<void> {
 }
 
 async function handleAddTask(arg?: unknown, forceRoot = false): Promise<void> {
-  const taskRef = extractTaskCommandRef(arg);
-  const doc = await resolvePlanDocumentForCommand(taskRef);
-  const parsed = parsePlanMarkdown(doc.getText());
-  const activeEditor = vscode.window.activeTextEditor;
-  const taskId = taskRef.taskId;
-  const parent = forceRoot
-    ? undefined
-    : taskId
-      ? findTaskById(parsed.tasks, taskId)
-      : activeEditor && isPlanDocument(activeEditor.document)
-        ? findTaskByLine(parsed.tasks, activeEditor.selection.active.line)
-        : undefined;
+  const { taskRef, doc, parsed } = await loadPlanCommandContext(arg);
+  const parent = forceRoot ? undefined : resolveTaskTarget(parsed, taskRef, getActivePlanEditor());
 
   const input = await vscode.window.showInputBox({
     prompt: parent ? `Add child task under ${parent.id}` : "Add top-level task",
@@ -497,19 +507,14 @@ async function handleAddTask(arg?: unknown, forceRoot = false): Promise<void> {
     parsed.tasks.push(makeTaskNode(nextId(), title, 0, null));
   }
 
-  await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
-  const latest = await vscode.workspace.openTextDocument(doc.uri);
-  await refreshFromDocument(latest);
+  await writeAndRefreshPlan(doc.uri, serializePlanMarkdown(parsed.tasks));
   vscode.window.showInformationMessage(`Added task: ${title}`);
 }
 
 async function handleDrillDown(arg?: unknown): Promise<void> {
-  const taskRef = extractTaskCommandRef(arg);
-  const doc = await resolvePlanDocumentForCommand(taskRef);
+  const { taskRef, doc, parsed } = await loadPlanCommandContext(arg);
   const editor = await vscode.window.showTextDocument(doc, { preview: false });
-  const parsed = parsePlanMarkdown(doc.getText());
-  const taskId = taskRef.taskId;
-  const target = taskId ? findTaskById(parsed.tasks, taskId) : findTaskByLine(parsed.tasks, editor.selection.active.line);
+  const target = resolveTaskTarget(parsed, taskRef, editor);
 
   if (!target) {
     vscode.window.showErrorMessage("No task found to drill down.");
@@ -523,16 +528,8 @@ async function handleDrillDown(arg?: unknown): Promise<void> {
 }
 
 async function handleImplementTask(arg?: unknown): Promise<void> {
-  const taskRef = extractTaskCommandRef(arg);
-  const doc = await resolvePlanDocumentForCommand(taskRef);
-  const parsed = parsePlanMarkdown(doc.getText());
-  const activeEditor = vscode.window.activeTextEditor;
-  const taskId = taskRef.taskId;
-  const target = taskId
-    ? findTaskById(parsed.tasks, taskId)
-    : activeEditor && isPlanDocument(activeEditor.document)
-      ? findTaskByLine(parsed.tasks, activeEditor.selection.active.line)
-      : undefined;
+  const { taskRef, doc, parsed } = await loadPlanCommandContext(arg);
+  const target = resolveTaskTarget(parsed, taskRef, getActivePlanEditor());
 
   if (!target) {
     vscode.window.showErrorMessage("No task found to implement.");
@@ -591,9 +588,7 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
 
       // Implement command represents completion for the selected feature scope.
       markTaskSubtreeStatus(target, "x");
-      await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
-      const refreshedDoc = await vscode.workspace.openTextDocument(doc.uri);
-      await refreshFromDocument(refreshedDoc);
+      await writeAndRefreshPlan(doc.uri, serializePlanMarkdown(parsed.tasks));
 
       if (writtenFiles.length > 0) {
         const first = vscode.Uri.joinPath(getWorkspaceRootUri(), ...writtenFiles[0].split("/"));
@@ -610,16 +605,8 @@ async function handleImplementTask(arg?: unknown): Promise<void> {
 }
 
 async function handleDeleteTask(arg?: unknown): Promise<void> {
-  const taskRef = extractTaskCommandRef(arg);
-  const doc = await resolvePlanDocumentForCommand(taskRef);
-  const parsed = parsePlanMarkdown(doc.getText());
-  const activeEditor = vscode.window.activeTextEditor;
-  const taskId = taskRef.taskId;
-  const target = taskId
-    ? findTaskById(parsed.tasks, taskId)
-    : activeEditor && isPlanDocument(activeEditor.document)
-      ? findTaskByLine(parsed.tasks, activeEditor.selection.active.line)
-      : undefined;
+  const { taskRef, doc, parsed } = await loadPlanCommandContext(arg);
+  const target = resolveTaskTarget(parsed, taskRef, getActivePlanEditor());
 
   if (!target) {
     vscode.window.showErrorMessage("No task found to delete.");
@@ -641,9 +628,7 @@ async function handleDeleteTask(arg?: unknown): Promise<void> {
     return;
   }
 
-  await writePlanContent(doc.uri, serializePlanMarkdown(parsed.tasks));
-  const latest = await vscode.workspace.openTextDocument(doc.uri);
-  await refreshFromDocument(latest);
+  await writeAndRefreshPlan(doc.uri, serializePlanMarkdown(parsed.tasks));
   vscode.window.showInformationMessage(`Deleted task ${target.id}.`);
 }
 
@@ -660,7 +645,7 @@ async function syncExecutionQueue(document: vscode.TextDocument): Promise<void> 
 }
 
 async function refreshFromDocument(document: vscode.TextDocument): Promise<void> {
-  const parsed = parsePlanMarkdown(document.getText());
+  const parsed = getCachedParsedPlan(document);
   activePlanUri = document.uri;
   setTreeTasks(parsed.tasks, document.uri);
   updateVisiblePlanDecorations();
@@ -693,13 +678,13 @@ function updateVisiblePlanDecorations(): void {
     if (!isPlanDocument(editor.document)) {
       continue;
     }
-    const parsed = parsePlanMarkdown(editor.document.getText());
+    const parsed = getCachedParsedPlan(editor.document);
     const tasks = isOnlyBootstrapPlaceholder(parsed.tasks) ? [] : parsed.tasks;
     const planLines: vscode.DecorationOptions[] = [];
     const executeLines: vscode.DecorationOptions[] = [];
 
     const leaves = new Set(listLeafTasks(tasks).map((task) => task.id));
-    walk(tasks, (task) => {
+    walkTasks(tasks, (task) => {
       if (task.line < 0 || task.line >= editor.document.lineCount) {
         return;
       }
@@ -714,98 +699,6 @@ function updateVisiblePlanDecorations(): void {
     editor.setDecorations(planDecorationType, planLines);
     editor.setDecorations(executeDecorationType, executeLines);
   }
-}
-
-async function ensurePlanDocument(preferredUri?: vscode.Uri): Promise<vscode.TextDocument> {
-  if (preferredUri && isSupportedPlanUri(preferredUri)) {
-    if (!(await uriExists(preferredUri))) {
-      await vscode.workspace.fs.writeFile(preferredUri, Buffer.from(serializePlanMarkdown([]), "utf8"));
-    }
-    return vscode.workspace.openTextDocument(preferredUri);
-  }
-
-  const existing = await findExistingPlanDocument();
-  if (existing) {
-    return existing;
-  }
-
-  const root = getWorkspaceRootUri();
-  const uri = vscode.Uri.joinPath(root, DEFAULT_PLAN_FILENAME);
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(serializePlanMarkdown([]), "utf8"));
-  return vscode.workspace.openTextDocument(uri);
-}
-
-async function resolvePlanDocumentForCommand(taskRef?: TaskCommandRef): Promise<vscode.TextDocument> {
-  const taskId = taskRef?.taskId;
-  const candidates: vscode.Uri[] = [];
-  const pushCandidate = (uri?: vscode.Uri): void => {
-    if (!uri || !isSupportedPlanUri(uri)) {
-      return;
-    }
-    const key = uri.toString();
-    if (!candidates.some((existing) => existing.toString() === key)) {
-      candidates.push(uri);
-    }
-  };
-
-  pushCandidate(taskRef?.fileUri);
-
-  const activeDoc = vscode.window.activeTextEditor?.document;
-  if (activeDoc && isPlanDocument(activeDoc)) {
-    pushCandidate(activeDoc.uri);
-  }
-
-  pushCandidate(activePlanUri);
-
-  const existingUris = await findExistingPlanUris();
-  for (const uri of existingUris) {
-    pushCandidate(uri);
-  }
-
-  for (const uri of candidates) {
-    const doc = await vscode.workspace.openTextDocument(uri);
-    if (!taskId) {
-      return doc;
-    }
-    const parsed = parsePlanMarkdown(doc.getText());
-    if (findTaskById(parsed.tasks, taskId)) {
-      return doc;
-    }
-  }
-
-  return ensurePlanDocument(taskRef?.fileUri);
-}
-
-async function findExistingPlanDocument(): Promise<vscode.TextDocument | undefined> {
-  const uris = await findExistingPlanUris();
-  if (uris.length === 0) {
-    return undefined;
-  }
-  return vscode.workspace.openTextDocument(uris[0]);
-}
-
-async function findExistingPlanUris(): Promise<vscode.Uri[]> {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root) {
-    return [];
-  }
-
-  const result: vscode.Uri[] = [];
-  for (const name of PLAN_FILENAMES) {
-    const uri = vscode.Uri.joinPath(root, name);
-    if (await uriExists(uri)) {
-      result.push(uri);
-    }
-  }
-  return result;
-}
-
-function getWorkspaceRootUri(): vscode.Uri {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root) {
-    throw new Error("PlanMyProject requires an open folder or workspace.");
-  }
-  return root;
 }
 
 async function pickRequirementFileFromRoot(root: vscode.Uri): Promise<vscode.Uri | undefined> {
@@ -849,169 +742,10 @@ async function pickRequirementFileFromRoot(root: vscode.Uri): Promise<vscode.Uri
   return vscode.Uri.joinPath(root, picked.label);
 }
 
-function extractRootTaskCandidates(markdown: string): string[] {
-  const lines = markdown.split(/\r?\n/);
-  const titles: string[] = [];
-  const seen = new Set<string>();
-  let inCodeBlock = false;
-  let paragraphBuffer: string[] = [];
-
-  const flushParagraph = (): void => {
-    if (paragraphBuffer.length === 0) {
-      return;
-    }
-    const paragraph = paragraphBuffer.join(" ").replace(/\s+/g, " ").trim();
-    paragraphBuffer = [];
-    if (!paragraph) {
-      return;
-    }
-    pushCandidate(paragraph, titles, seen);
-    if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
-      return;
-    }
-  };
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (trimmed.startsWith("```")) {
-      flushParagraph();
-      inCodeBlock = !inCodeBlock;
-      continue;
-    }
-    if (inCodeBlock) {
-      continue;
-    }
-
-    if (!trimmed) {
-      flushParagraph();
-      continue;
-    }
-
-    if (/^<!--.*-->$/.test(trimmed)) {
-      continue;
-    }
-
-    const heading = /^#{1,6}\s+(.+)$/.exec(trimmed);
-    if (heading) {
-      flushParagraph();
-      continue;
-    }
-
-    const listMatch = /^[-*+]\s+(.+)$/.exec(rawLine) ?? /^\d+[.)]\s+(.+)$/.exec(trimmed);
-    if (listMatch) {
-      flushParagraph();
-      pushCandidate(listMatch[1], titles, seen);
-      if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
-        break;
-      }
-      continue;
-    }
-
-    paragraphBuffer.push(trimmed);
-    if (/[.!?]$/.test(trimmed)) {
-      flushParagraph();
-    }
-    if (titles.length >= MAX_IMPORTED_ROOT_TASKS) {
-      break;
-    }
-  }
-
-  flushParagraph();
-  return titles.slice(0, MAX_IMPORTED_ROOT_TASKS);
-}
-
-function pushCandidate(rawValue: string, titles: string[], seen: Set<string>): void {
-  const title = normalizeImportedTaskTitle(rawValue);
-  if (!title || isGenericHeadingTitle(title)) {
-    return;
-  }
-
-  const key = title.toLowerCase();
-  if (seen.has(key)) {
-    return;
-  }
-
-  seen.add(key);
-  titles.push(title);
-}
-
-function isGenericHeadingTitle(value: string): boolean {
-  const normalized = value
-    .toLowerCase()
-    .replace(/[:\s]+$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  return NON_TASK_HEADING_TITLES.has(normalized);
-}
-
-function normalizeImportedTaskTitle(value: string): string | undefined {
-  const compact = value
-    .replace(/^\s*[-*+\d.)]+\s+/, "")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/~~([^~]+)~~/g, "$1")
-    .replace(/^[\[\(]+/, "")
-    .replace(/[\]\)]+$/, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/[.:;,\-]+$/, "")
-    .trim();
-
-  if (compact.length < MIN_IMPORT_TASK_LENGTH || compact.length > MAX_IMPORT_TASK_LENGTH) {
-    return undefined;
-  }
-
-  if (/^(?:epic|story|task|item)\s+\d+$/i.test(compact)) {
-    return undefined;
-  }
-
-  // Avoid importing pure metadata lines like "Owner: X" as root requirements.
-  if (/^[A-Za-z][A-Za-z0-9 _-]{0,24}:\s+\S+/.test(compact)) {
-    return undefined;
-  }
-
-  return compact;
-}
-
-function hasImportableMarkdownRequirements(markdown: string): boolean {
-  return extractRootTaskCandidates(markdown).length > 0;
-}
-
 async function validateRequirementFileContent(uri: vscode.Uri): Promise<boolean> {
   const bytes = await vscode.workspace.fs.readFile(uri);
   const content = Buffer.from(bytes).toString("utf8");
   return hasImportableMarkdownRequirements(content);
-}
-
-function hasExplicitRequirementList(markdown: string): boolean {
-  const lines = markdown.split(/\r?\n/);
-  let inCodeBlock = false;
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (trimmed.startsWith("```")) {
-      inCodeBlock = !inCodeBlock;
-      continue;
-    }
-    if (inCodeBlock) {
-      continue;
-    }
-    if (/^[-*+]\s+.+/.test(rawLine) || /^\d+[.)]\s+.+/.test(trimmed)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function buildConsolidatedRequirementTitle(requirementFile: vscode.Uri, candidates: string[]): string {
-  const stem = path.parse(requirementFile.fsPath).name.replace(/[_-]+/g, " ").trim();
-  if (stem.length >= 3) {
-    return `Implement requirements from ${stem}`;
-  }
-  return candidates[0];
 }
 
 async function pickLoadableRequirementFile(root: vscode.Uri): Promise<vscode.Uri | undefined> {
@@ -1089,21 +823,19 @@ async function handleLoadRequirementsFile(): Promise<void> {
     nextTasks.push(makeTaskNode(nextId(), title, 0, null));
   }
 
-  await writePlanContent(planDoc.uri, serializePlanMarkdown(nextTasks));
-  const latest = await vscode.workspace.openTextDocument(planDoc.uri);
+  const latest = await writeAndRefreshPlan(planDoc.uri, serializePlanMarkdown(nextTasks));
   await vscode.window.showTextDocument(latest, { preview: false });
-  await refreshFromDocument(latest);
   vscode.window.showInformationMessage(
     `Imported ${finalTitles.length} root task(s) from ${vscode.workspace.asRelativePath(requirementFile, false)}.`
   );
 }
 
-async function writePlanContent(uri: vscode.Uri, text: string): Promise<void> {
+async function writePlanContent(uri: vscode.Uri, text: string): Promise<vscode.TextDocument> {
   internalWriteDepth += 1;
   try {
     const document = await vscode.workspace.openTextDocument(uri);
     if (document.getText() === text) {
-      return;
+      return document;
     }
     const fullRange = new vscode.Range(
       document.positionAt(0),
@@ -1114,86 +846,11 @@ async function writePlanContent(uri: vscode.Uri, text: string): Promise<void> {
     await vscode.workspace.applyEdit(edit);
     const latest = await vscode.workspace.openTextDocument(uri);
     await latest.save();
+    clearCachedParsedPlan(uri);
+    return latest;
   } finally {
     internalWriteDepth -= 1;
   }
-}
-
-function isPlanDocument(document: vscode.TextDocument): boolean {
-  return isSupportedPlanUri(document.uri);
-}
-
-function isSupportedPlanUri(uri: vscode.Uri): boolean {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root || uri.scheme !== "file") {
-    return false;
-  }
-  const name = path.basename(uri.fsPath).toLowerCase();
-  if (!PLAN_FILENAMES.includes(name as (typeof PLAN_FILENAMES)[number])) {
-    return false;
-  }
-  return path.resolve(path.dirname(uri.fsPath)) === path.resolve(root.fsPath);
-}
-
-function extractTaskCommandRef(arg?: unknown): TaskCommandRef {
-  const ref: TaskCommandRef = {};
-  if (!arg) {
-    return ref;
-  }
-
-  if (typeof arg === "string") {
-    ref.taskId = arg;
-    return ref;
-  }
-
-  if (Array.isArray(arg) && typeof arg[0] === "string") {
-    ref.taskId = arg[0];
-    return ref;
-  }
-
-  if (typeof arg === "object") {
-    const value = arg as Record<string, unknown>;
-    if (typeof value.taskId === "string") {
-      ref.taskId = value.taskId;
-    } else if (typeof value.id === "string") {
-      ref.taskId = value.id;
-    } else if (typeof value.label === "string") {
-      ref.taskId = value.label;
-    }
-
-    const uriCandidate = toUri(value.fileUri)
-      ?? toUri(value.resourceUri)
-      ?? toUri(value.uri);
-    if (uriCandidate && isSupportedPlanUri(uriCandidate)) {
-      ref.fileUri = uriCandidate;
-    }
-  }
-
-  return ref;
-}
-
-function toUri(candidate: unknown): vscode.Uri | undefined {
-  if (candidate instanceof vscode.Uri) {
-    return candidate;
-  }
-  if (typeof candidate !== "string") {
-    return undefined;
-  }
-  const trimmed = candidate.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  if (trimmed.startsWith("file:") || trimmed.includes("://")) {
-    try {
-      return vscode.Uri.parse(trimmed, true);
-    } catch {
-      return undefined;
-    }
-  }
-  if (path.isAbsolute(trimmed)) {
-    return vscode.Uri.file(trimmed);
-  }
-  return undefined;
 }
 
 function toErrorMessage(error: unknown): string {
@@ -1214,87 +871,6 @@ function throwIfCancelled(token: vscode.CancellationToken): void {
   if (token.isCancellationRequested) {
     throw new Error("Cancelled by user.");
   }
-}
-
-async function uriExists(uri: vscode.Uri): Promise<boolean> {
-  try {
-    await vscode.workspace.fs.stat(uri);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function collectRelevantFiles(taskTitle: string, maxResults: number): Promise<string[]> {
-  const workspace = vscode.workspace.workspaceFolders?.[0];
-  if (!workspace) {
-    return [];
-  }
-
-  const files = await vscode.workspace.findFiles(
-    "**/*",
-    "{**/.git/**,**/node_modules/**,**/dist/**,**/out/**,**/build/**,**/.next/**}",
-    350
-  );
-
-  const tokens = taskTitle
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((token) => token.length >= 4);
-
-  const relative = files.map((uri) => vscode.workspace.asRelativePath(uri, false));
-  const filtered = tokens.length
-    ? relative.filter((file) => tokens.some((token) => file.toLowerCase().includes(token)))
-    : [];
-
-  const selected = filtered.length > 0 ? filtered : relative;
-  return selected.slice(0, maxResults);
-}
-
-async function collectRelevantFileSnapshots(
-  filePaths: string[],
-  maxFiles: number,
-  perFileLimit: number,
-  totalLimit: number
-): Promise<FileSnapshot[]> {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root) {
-    return [];
-  }
-
-  const snapshots: FileSnapshot[] = [];
-  let totalChars = 0;
-
-  for (const relativePath of filePaths) {
-    if (snapshots.length >= maxFiles || totalChars >= totalLimit) {
-      break;
-    }
-    if (!relativePath || relativePath.endsWith(".png") || relativePath.endsWith(".jpg") || relativePath.endsWith(".svg")) {
-      continue;
-    }
-
-    try {
-      const uri = vscode.Uri.joinPath(root, ...relativePath.split("/"));
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString("utf8");
-      if (content.includes("\u0000")) {
-        continue;
-      }
-      const remaining = Math.max(totalLimit - totalChars, 0);
-      if (remaining === 0) {
-        break;
-      }
-      const allowed = Math.min(perFileLimit, remaining);
-      const truncated = content.length > allowed;
-      const trimmed = content.slice(0, allowed);
-      snapshots.push({ path: relativePath, content: trimmed, truncated });
-      totalChars += trimmed.length;
-    } catch {
-      // Skip unreadable files and continue collecting context.
-    }
-  }
-
-  return snapshots;
 }
 
 function summarizePathList(paths: string[], previewLimit: number): string {
@@ -1372,7 +948,7 @@ async function parseImplementationWithRepair(
       throw new Error("Cancelled implementation: repair request to Copilot was not approved.");
     }
 
-    const repairPrompt = buildImplementRepairPrompt(modelOutput);
+    const repairPrompt = buildImplementRepairPrompt(modelOutput, MAX_REPAIR_INPUT_CHARS);
     const lm = await loadLmModule();
     const safeRepairPrompt = lm.maskSensitiveText(repairPrompt);
     let repaired = "";
@@ -1425,179 +1001,6 @@ async function applyImplementationChanges(payload: ImplementationPayload): Promi
   return written;
 }
 
-async function resolveWorkspaceWriteTargetUri(root: vscode.Uri, relativePath: string): Promise<vscode.Uri> {
-  const rootFsPath = path.resolve(root.fsPath);
-  const targetFsPath = path.resolve(rootFsPath, ...relativePath.split("/"));
-  if (!isPathWithin(rootFsPath, targetFsPath)) {
-    throw new Error(`Refusing to write outside workspace root: ${relativePath}`);
-  }
-
-  const canonicalRoot = await resolveCanonicalPath(rootFsPath);
-  const ancestorRealPath = await findNearestExistingAncestorRealPath(targetFsPath, rootFsPath);
-  if (ancestorRealPath && !isPathWithin(canonicalRoot, ancestorRealPath)) {
-    throw new Error(`Refusing to write through symlink outside workspace root: ${relativePath}`);
-  }
-
-  return vscode.Uri.file(targetFsPath);
-}
-
-async function resolveCanonicalPath(fsPath: string): Promise<string> {
-  try {
-    return await fs.realpath(fsPath);
-  } catch {
-    return path.resolve(fsPath);
-  }
-}
-
-async function findNearestExistingAncestorRealPath(
-  targetFsPath: string,
-  rootFsPath: string
-): Promise<string | undefined> {
-  let current = targetFsPath;
-  while (isPathWithin(rootFsPath, current)) {
-    try {
-      return await fs.realpath(current);
-    } catch {
-      const parent = path.dirname(current);
-      if (parent === current) {
-        return undefined;
-      }
-      current = parent;
-    }
-  }
-
-  return undefined;
-}
-
-function isPathWithin(parentPath: string, childPath: string): boolean {
-  const parent = normalizePathForComparison(parentPath);
-  const child = normalizePathForComparison(childPath);
-  const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function normalizePathForComparison(fsPath: string): string {
-  const resolved = path.resolve(fsPath);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
-}
-
-function buildPlanPrompt(
-  target: TaskNode,
-  ancestors: TaskNode[],
-  relatedFiles: string[],
-  existingChildren: string[],
-  mode: "replace" | "refine"
-): string {
-  const hierarchy = ancestors.map((node, index) => `${index + 1}. [${node.id}] ${node.title}`).join("\n");
-  const childContext = existingChildren.length
-    ? existingChildren.map((item, index) => `${index + 1}. ${item}`).join("\n")
-    : "(none)";
-  const filesContext = relatedFiles.length > 0 ? relatedFiles.join("\n") : "(no file hints available)";
-
-  return [
-    "You are a planning assistant for software implementation tasks.",
-    "Output only one level of immediate child tasks for the selected task.",
-    "Do not create nested bullets.",
-    "Return exactly 3 to 5 bullet points using '- ' format.",
-    "Each bullet must be concise and actionable.",
-    "",
-    `Mode: ${mode}`,
-    `Selected Task: [${target.id}] ${target.title}`,
-    "",
-    "Ancestor chain (root to selected):",
-    hierarchy,
-    "",
-    "Existing children (if any):",
-    childContext,
-    "",
-    "Potentially relevant files from codebase:",
-    filesContext,
-    "",
-    "Constraints:",
-    "- Plan exactly one level under the selected task.",
-    "- No explanations, no code block, no numbering.",
-    "- Keep each task focused enough for implementation execution."
-  ].join("\n");
-}
-
-function buildImplementPrompt(
-  target: TaskNode,
-  ancestors: TaskNode[],
-  relatedFiles: string[],
-  snapshots: FileSnapshot[]
-): string {
-  const hierarchy = ancestors.map((node, index) => `${index + 1}. [${node.id}] ${node.title}`).join("\n");
-  const filesContext = relatedFiles.length > 0 ? relatedFiles.join("\n") : "(no file hints available)";
-  const snapshotContext = snapshots.length > 0
-    ? snapshots.map((snapshot) => {
-      const escaped = snapshot.content.replace(/```/g, "``\\`");
-      const truncation = snapshot.truncated ? "\n// [truncated]" : "";
-      return [
-        `File: ${snapshot.path}`,
-        "```",
-        `${escaped}${truncation}`,
-        "```"
-      ].join("\n");
-    }).join("\n\n")
-    : "(no file snapshots available)";
-
-  return [
-    "You are an implementation agent for a VS Code project workspace.",
-    "Implement the selected task by returning file writes that can be applied directly.",
-    "Respond with JSON only, no markdown and no commentary.",
-    "",
-    `Selected Task: [${target.id}] ${target.title}`,
-    "",
-    "Task hierarchy context:",
-    hierarchy,
-    "",
-    "Potentially relevant file paths:",
-    filesContext,
-    "",
-    "Existing file snapshots:",
-    snapshotContext,
-    "",
-    "Required JSON schema:",
-    "{",
-    "  \"summary\": \"short summary\",",
-    "  \"taskCompleted\": true,",
-    "  \"changes\": [",
-    "    { \"path\": \"src/file.ts\", \"content\": \"full updated file content\" }",
-    "  ],",
-    "  \"tests\": [\"commands or checks you ran or recommend\"],",
-    "  \"risks\": [\"known limitations\"]",
-    "}",
-    "",
-    "Rules:",
-    "- Use only workspace-relative paths.",
-    "- Do not use absolute paths.",
-    "- Do not use '..' segments.",
-    "- For every change entry, include the full file content, not a patch.",
-    "- Include at least one change."
-  ].join("\n");
-}
-
-function buildImplementRepairPrompt(output: string): string {
-  const trimmedOutput = output.slice(0, MAX_REPAIR_INPUT_CHARS);
-  return [
-    "Convert the following text into STRICT JSON only.",
-    "Do not include markdown fences or any extra words.",
-    "Return this exact schema:",
-    "{",
-    "  \"summary\": \"short summary\",",
-    "  \"taskCompleted\": true,",
-    "  \"changes\": [",
-    "    { \"path\": \"src/file.ts\", \"content\": \"full updated file content\" }",
-    "  ],",
-    "  \"tests\": [\"...\"] ,",
-    "  \"risks\": [\"...\"]",
-    "}",
-    "If data is missing, infer best effort values but keep at least one change item.",
-    "",
-    "Text to convert:",
-    trimmedOutput
-  ].join("\n");
-}
 
 function markTaskSubtreeStatus(task: TaskNode, status: TaskNode["status"]): void {
   task.status = status;
@@ -1628,23 +1031,16 @@ function deleteTaskById(tasks: TaskNode[], taskId: string): boolean {
   return false;
 }
 
-function walk(tasks: TaskNode[], visitor: (task: TaskNode) => void): void {
-  for (const task of tasks) {
-    visitor(task);
-    walk(task.children, visitor);
-  }
-}
-
 class PlanCodeLensProvider implements vscode.CodeLensProvider {
   provideCodeLenses(document: vscode.TextDocument): vscode.ProviderResult<vscode.CodeLens[]> {
     if (!isPlanDocument(document)) {
       return [];
     }
 
-    const parsed = parsePlanMarkdown(document.getText());
+    const parsed = getCachedParsedPlan(document);
     const codeLenses: vscode.CodeLens[] = [];
 
-    walk(parsed.tasks, (task) => {
+    walkTasks(parsed.tasks, (task) => {
       if (task.line < 0 || task.line >= document.lineCount) {
         return;
       }

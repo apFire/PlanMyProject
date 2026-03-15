@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Refactored the extension entrypoint into smaller helper modules to reduce `extension.ts` size and repeated plan parsing work.
+- Fixed the tree view toolbar add action so it creates a new root task even when tasks already exist.
 - Optimized activation and startup overhead with lazy loading and narrower activation/watch scopes.
 - Added in-tree progress reporting for Copilot requests and moved status to the active task item.
 - Added cancellable active-request flow with `PlanMyProject: Cancel Active Request`.

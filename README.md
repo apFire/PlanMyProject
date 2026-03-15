@@ -90,6 +90,7 @@ Result: root tasks are added with generated IDs
 
 - `PlanMyProject: Add Root Task` creates a root task
 - `PlanMyProject: Add Task` creates a child task under selected task
+- In the tree view, the title-bar add button creates a new root task, while the item inline add action creates a child task for that item
 
 Example:
 
@@ -140,6 +141,7 @@ Example response format:
 ### 7) Tree view, CodeLens, and drill-down workflow
 
 - Activity Bar container: `PlanMyProject` -> `Implementation Tree`
+- Tree toolbar add action creates root tasks without depending on current editor selection
 - Task actions in tree context menu: Add, Plan, Implement, Drill, Delete
 - While a request is running, the active task item shows live progress/status directly in that item
 - Running task item exposes `Cancel Active Request` and hides other inline actions

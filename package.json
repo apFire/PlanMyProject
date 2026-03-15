@@ -77,7 +77,11 @@
       },
       {
         "command": "planmyproject.addRootTask",
-        "title": "PlanMyProject: Add Root Task"
+        "title": "PlanMyProject: Add Root Task",
+        "icon": {
+          "light": "media/add.svg",
+          "dark": "media/add.svg"
+        }
       },
       {
         "command": "planmyproject.loadRequirementsFile",
@@ -171,7 +175,7 @@
     "menus": {
       "view/title": [
         {
-          "command": "planmyproject.addTask",
+          "command": "planmyproject.addRootTask",
           "when": "view == planmyproject.tree && planmyproject.workspaceOpen",
           "group": "navigation@1"
         },
