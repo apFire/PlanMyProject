@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- No changes yet.
+
+## [1.0.1] - 2026-03-15
+
+- Updated release documentation: moved `Unreleased` implementation notes into the `1.0.0` section.
+- Updated README to reflect current release version `v1.0.1`.
+
+## [1.0.0] - 2026-03-15
+
 - Refactored the extension entrypoint into smaller helper modules to reduce `extension.ts` size and repeated plan parsing work.
 - Fixed the tree view toolbar add action so it creates a new root task even when tasks already exist.
 - Optimized activation and startup overhead with lazy loading and narrower activation/watch scopes.
